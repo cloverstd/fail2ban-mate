@@ -10,7 +10,7 @@
 - 手动封禁、单次解封、批量解封，以及覆盖所有节点和 service 的限时放行、永久白名单。
 - 限时放行在客户端本地到期，控制端断网仍可恢复正常检测；保留节点原有白名单。
 - DB-IP City Lite 本地查询来源城市，无定位 API 密钥；按月更新。
-- 一行安装命令、systemd、自带升级和卸载流程；GitHub Actions 发布双架构二进制及自动部署 Workers。
+- 一行安装命令、systemd、自带升级和卸载流程；GitHub Actions 发布客户端双架构二进制；Cloudflare Workers Builds 负责服务端构建与部署。
 
 公开页面仅返回脱敏 IP：来源 IPv4 `1.2.3.x`、节点 IPv4 `1.2.x.x`；IPv6 来源保留前三组，节点保留前两组。完整 IP 仅在后台可见。地图数据随网页分发，无地图 API 或第三方瓦片请求。
 
@@ -46,7 +46,7 @@ pnpm exec wrangler login
 pnpm exec wrangler d1 create fail2ban-mate
 ```
 
-保存返回的 `database_id`，用于后面的 `D1_DATABASE_ID`。仓库中的全零 UUID 是占位符，不应直接部署到生产。
+本项目的 D1 已创建，生产数据库 ID 为 `938674ac-567c-4583-a6b4-64ba0b78633a`，已写入 `wrangler.jsonc`。在其他账号部署时，用新建数据库 ID 覆盖构建变量 `D1_DATABASE_ID`。
 
 ### 2. 配置 GitHub 和 Cloudflare Access
 
@@ -63,27 +63,45 @@ Worker 本身也会校验 JWT，因此通过备用域名绕过 Access 边缘策�
 
 参考：[Access GitHub 身份提供商](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/github/)、[Access JWT 校验](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)。
 
-### 3. 配置 GitHub Actions
+### 3. 配置 Cloudflare Workers Builds
 
-仓库 Settings → Secrets and variables → Actions 配置：
+服务端由 **Cloudflare Workers Builds** 从 GitHub 拉取源码后构建和部署。GitHub Actions 负责代码检查与 Go 客户端发布，不部署 Worker，也不需要在 GitHub 保存 Cloudflare 部署凭据。
 
-| 类型     | 名称                    | 值                                                                                                 |
-| -------- | ----------------------- | -------------------------------------------------------------------------------------------------- |
-| Secret   | `CLOUDFLARE_API_TOKEN`  | 具有目标账号 Workers Scripts 编辑、D1 编辑等部署权限的 API token；使用自定义域名时还需对应域名权限 |
-| Secret   | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID                                                                              |
-| Variable | `D1_DATABASE_ID`        | 第一步生成的数据库 UUID                                                                            |
-| Variable | `ACCESS_TEAM_DOMAIN`    | `https://your-team.cloudflareaccess.com`                                                           |
-| Variable | `ACCESS_AUD`            | Access Application 的 AUD                                                                          |
-| Variable | `ADMIN_EMAILS`          | 例如 `you@example.com`，需为 GitHub 身份对应的邮箱                                                 |
-| Variable | `WORKER_DOMAIN`         | 可选，例如 `ban.example.com`，不要包含协议或路径                                                   |
+在 Cloudflare → Workers & Pages → `fail2ban-mate` → Settings → Builds，连接 GitHub 仓库 `cloverstd/fail2ban-mate`。使用以下配置：
 
-推送 `main` 后，Deploy Workers 在检查成功后先迁移 D1，再部署 Worker。也可在 Actions 手动运行。部署所需的 `D1_DATABASE_ID`、`ACCESS_TEAM_DOMAIN`、`ACCESS_AUD`、`ADMIN_EMAILS` 未齐时会跳过部署任务，以便空账号先完成仓库检查和客户端发布；设置后其他缺失配置会明确报错。部署任务串行执行，不取消已开始的迁移。
+| 配置                                    | 值                                                                   |
+| --------------------------------------- | -------------------------------------------------------------------- |
+| Production branch                       | `main`                                                               |
+| Root directory                          | `/`                                                                  |
+| Build command                           | `pnpm run build:cloudflare`                                          |
+| Deploy command                          | `pnpm run deploy:cloudflare`                                         |
+| Non-production branch builds / Previews | 关闭，避免其他分支使用生产 D1                                        |
+| Build token                             | Cloudflare 管理的部署 token，需有 Workers Scripts 编辑和 D1 编辑权限 |
+
+Build command 生成部署配置，运行 TypeScript / Vite 构建、Workers 集成测试和部署配置测试。Deploy command 在迁移成功后才部署 Worker；迁移失败会停止部署。若 Access 配置未完成，构建会明确报错，保留当前部署。
+
+在 **Cloudflare Builds 构建变量** 中配置：
+
+| 名称                 | 值                                               |
+| -------------------- | ------------------------------------------------ |
+| `NODE_VERSION`       | `22`                                             |
+| `ACCESS_TEAM_DOMAIN` | `https://your-team.cloudflareaccess.com`         |
+| `ACCESS_AUD`         | Access Application 的 AUD                        |
+| `ADMIN_EMAILS`       | 已默认设为 `cloverstd@gmail.com`，可选覆盖       |
+| `D1_DATABASE_ID`     | 已默认设为本项目生产 D1 ID，其他账号部署时覆盖   |
+| `WORKER_DOMAIN`      | 可选，例如 `ban.example.com`，不要包含协议或路径 |
+
+`packageManager` 将 pnpm 固定为 `9.15.9`。Access 的团队域名、AUD 和邮箱属于非敏感运行配置，部署脚本会写入 Worker vars；GitHub OAuth secret 只保存在 Cloudflare Access 身份提供商中。
+
+Workers Builds 的 GitHub App 首次安装需要 GitHub 账号所有者授权。使用 API 管理 Builds 时，需要具有 **Workers Builds Configuration: Edit** 的用户级 API token；Wrangler 默认 OAuth 的部署权限不包含这项配置权限。配置 Zero Trust 组织、身份提供商与应用，还分别需要 Access 组织/身份提供商编辑、Access 应用/策略编辑权限。
+
+参考：[Workers Builds 配置 API](https://developers.cloudflare.com/workers/ci-cd/builds/api-reference/)。API 读取到的真实资源 ID 才能用于配置，不能用猜测的团队域名或 AUD 代替。
 
 迁移应只使用兼容旧 Worker 的增量修改；代码回滚不会自动回滚 D1。迁移文件提交前应先在本地和测试环境执行。
 
 ### 手动部署
 
-将上表的 Variables 设置为当前命令环境变量，再执行：
+将上表中的 Access 构建变量设置为当前命令环境变量，再执行：
 
 ```sh
 node scripts/configure-deploy.mjs
@@ -93,6 +111,8 @@ pnpm exec wrangler deploy --config wrangler.deploy.json
 ```
 
 `wrangler.deploy.json` 为忽略的本地生成文件，`wrangler.jsonc` 保持可复用模板。Wrangler 可使用本地登录会话，或 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`。
+
+管理员默认邮箱为 `cloverstd@gmail.com`。Access 配置为空时，Worker 保持拒绝后台访问。
 
 ## 添加 Linux 节点
 

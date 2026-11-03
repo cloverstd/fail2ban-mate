@@ -38,3 +38,23 @@ test("rejects missing deployment identity and invalid hostname", () => {
     true,
   );
 });
+test("uses deployed D1 and administrator defaults while requiring real Access identity", () => {
+  const config = renderConfig(source, {
+    ACCESS_TEAM_DOMAIN: variables.ACCESS_TEAM_DOMAIN,
+    ACCESS_AUD: variables.ACCESS_AUD,
+  });
+  assert.equal(
+    config.d1_databases[0].database_id,
+    "938674ac-567c-4583-a6b4-64ba0b78633a",
+  );
+  assert.equal(config.vars.ADMIN_EMAILS, "cloverstd@gmail.com");
+  assert.throws(() => renderConfig(source, {}), /ACCESS_TEAM_DOMAIN/);
+  assert.throws(
+    () =>
+      renderConfig(source, {
+        ...variables,
+        D1_DATABASE_ID: "00000000-0000-0000-0000-000000000000",
+      }),
+    /placeholder/,
+  );
+});

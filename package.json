@@ -8,9 +8,11 @@
     "dev": "vite",
     "dev:worker": "wrangler dev",
     "build": "tsc --noEmit && vite build",
+    "build:cloudflare": "node scripts/configure-deploy.mjs && pnpm build && pnpm test && node --test tests/deploy-config.test.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "deploy": "pnpm build && wrangler deploy",
+    "deploy:cloudflare": "wrangler d1 migrations apply DB --remote --config wrangler.deploy.json && wrangler deploy --config wrangler.deploy.json",
     "db:local": "wrangler d1 migrations apply DB --local",
     "db:remote": "wrangler d1 migrations apply DB --remote"
   },

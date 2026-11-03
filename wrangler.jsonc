@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "fail2ban-mate",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "938674ac-567c-4583-a6b4-64ba0b78633a",
       "migrations_dir": "migrations",
     },
   ],
@@ -30,7 +30,7 @@
   "vars": {
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",
-    "ADMIN_EMAILS": "",
+    "ADMIN_EMAILS": "cloverstd@gmail.com",
     "RETENTION_DAYS": "30",
   },
   "observability": { "enabled": true, "logs": { "invocation_logs": false } },
