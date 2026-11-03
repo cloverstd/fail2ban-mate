@@ -14,6 +14,14 @@
 
 公开页面仅返回脱敏 IP：来源 IPv4 `1.2.3.x`、节点 IPv4 `1.2.x.x`；IPv6 来源保留前三组，节点保留前两组。完整 IP 仅在后台可见。地图数据随网页分发，无地图 API 或第三方瓦片请求。
 
+## 当前部署
+
+- 公开看板：[fail2ban-mate.cloverstd.workers.dev](https://fail2ban-mate.cloverstd.workers.dev)
+- 管理后台：[进入后台](https://fail2ban-mate.cloverstd.workers.dev/admin)，通过 Cloudflare Access 的 GitHub 身份提供商登录，仅允许 `cloverstd@gmail.com`。
+- 服务端 CI：Cloudflare Workers Builds 连接本仓库 `main`，负责检查、构建、D1 迁移和部署；非生产分支构建已关闭。
+- Access 使用现有团队 `cloverstd.cloudflareaccess.com`，仅保护后台页面和管理 API，公开页面与 agent 接口保持公开路由。
+- 客户端版本与二进制：[GitHub Releases](https://github.com/cloverstd/fail2ban-mate/releases)。
+
 ## 架构
 
 ```mermaid
