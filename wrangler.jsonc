@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fail2ban-mate",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-11-03",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/admin", "/admin/*"],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fail2ban-mate",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "NODES", "class_name": "NodeConnection" },
+      { "name": "DASHBOARD", "class_name": "Dashboard" },
+    ],
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["NodeConnection", "Dashboard"] },
+  ],
+  "triggers": { "crons": ["17 3 * * *"] },
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    "ADMIN_EMAILS": "",
+    "RETENTION_DAYS": "30",
+  },
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } },
+}

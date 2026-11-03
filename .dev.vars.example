@@ -1,0 +1,4 @@
+# Copy to .dev.vars. Authentication fails closed until configured.
+ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+ACCESS_AUD=your-access-application-audience
+ADMIN_EMAILS=you@example.com
