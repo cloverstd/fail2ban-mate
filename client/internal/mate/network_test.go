@@ -30,6 +30,10 @@ func TestRealNetworkFallbackToHTTP(t *testing.T) {
 	var attempts atomic.Int32
 	received := make(chan Sync, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agent/v1/addresses" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path == "/api/agent/v1/ws" {
 			attempts.Add(1)
 			w.WriteHeader(503)
@@ -74,6 +78,10 @@ func TestLiveSwitchHTTPToWebSocketAndBack(t *testing.T) {
 	var connections atomic.Int32
 	finished := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agent/v1/addresses" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path == "/api/agent/v1/ws" {
 			connections.Add(1)
 			c, err := websocket.Accept(w, r, nil)

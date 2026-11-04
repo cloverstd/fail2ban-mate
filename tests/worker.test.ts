@@ -18,6 +18,7 @@ import worker from "../worker";
 import { hash, secret } from "../worker/auth";
 import { maskIP } from "../worker/privacy";
 import { canonicalIP, syncSchema } from "../worker/validation";
+import { connectingAddress } from "../worker/addresses";
 import type { AgentSync, ServerSync } from "../shared/protocol";
 
 let privateKey: CryptoKey;
@@ -41,11 +42,19 @@ async function request(
   method = "GET",
   body?: unknown,
   bearer?: string,
-  opts: { admin?: boolean; origin?: string; token?: string } = {},
+  opts: {
+    admin?: boolean;
+    origin?: string;
+    token?: string;
+    ip?: string;
+    ipv6?: string;
+  } = {},
 ) {
   const headers = new Headers();
   if (body !== undefined) headers.set("Content-Type", "application/json");
   if (bearer) headers.set("Authorization", "Bearer " + bearer);
+  if (opts.ip) headers.set("CF-Connecting-IP", opts.ip);
+  if (opts.ipv6) headers.set("CF-Connecting-IPv6", opts.ipv6);
   if (opts.admin) headers.set("Cf-Access-Jwt-Assertion", opts.token ?? jwt);
   if (method !== "GET") headers.set("Origin", opts.origin ?? origin);
   const ctx = createExecutionContext();
@@ -116,6 +125,40 @@ beforeEach(async () => {
 });
 afterAll(() => vi.unstubAllGlobals());
 describe("access and enrollment", () => {
+  it("serves the separate administration page and assets only after authentication", async () => {
+    const assets = {
+      fetch: vi.fn(
+        async (request: RequestInfo | URL) =>
+          new Response(
+            new URL(request instanceof Request ? request.url : String(request))
+              .pathname,
+          ),
+      ),
+    };
+    const bindings = { ...env, ASSETS: { ...env.ASSETS, fetch: assets.fetch } };
+    for (const path of ["/admin", "/admin/nodes", "/admin/assets/private.js"]) {
+      const ctx = createExecutionContext();
+      const denied = await worker.fetch(
+        new Request(origin + path),
+        bindings,
+        ctx,
+      );
+      expect(denied.status).toBe(403);
+      expect(assets.fetch).not.toHaveBeenCalled();
+      const response = await worker.fetch(
+        new Request(origin + path, {
+          headers: { "Cf-Access-Jwt-Assertion": jwt },
+        }),
+        bindings,
+        ctx,
+      );
+      expect(await response.text()).toBe(
+        path.startsWith("/admin/assets/") ? path : "/admin/",
+      );
+      assets.fetch.mockClear();
+      await waitOnExecutionContext(ctx);
+    }
+  });
   it("fails closed and validates signature, audience, expiry, and email", async () => {
     for (const t of [
       "",
@@ -499,6 +542,106 @@ describe("sync and commands", () => {
   });
 });
 describe("public privacy", () => {
+  it("records both observed address families without overwriting one with the other", async () => {
+    const a = await create();
+    const b = await create("other-node");
+    expect((await request("/api/agent/v1/addresses")).status).toBe(401);
+    for (const ip of ["2001:db8:1::99", "192.0.2.99", "::ffff:192.0.2.99"]) {
+      expect(
+        (
+          await request("/api/agent/v1/addresses", "GET", undefined, a.token, {
+            ip,
+          })
+        ).status,
+      ).toBe(200);
+    }
+    // Normal synchronization also learns its transport's family and keeps the other.
+    await request("/api/agent/v1/sync", "POST", sync(), a.token, {
+      ip: "2001:db8:2::88",
+    });
+    expect(
+      await env.DB.prepare("SELECT ipv4,ipv6 FROM nodes WHERE id=?")
+        .bind(a.node_id)
+        .first(),
+    ).toEqual({ ipv4: "192.0.2.99", ipv6: "2001:db8:2::88" });
+    expect(
+      await env.DB.prepare("SELECT ipv4,ipv6 FROM nodes WHERE id=?")
+        .bind(b.node_id)
+        .first(),
+    ).toEqual({ ipv4: null, ipv6: null });
+    expect(
+      (
+        await request("/api/agent/v1/addresses", "GET", undefined, a.token, {
+          ip: "invalid",
+        })
+      ).status,
+    ).toBe(503);
+    const publicResponse = await request(
+      "/api/public/dashboard?dual-stack=" + crypto.randomUUID(),
+    );
+    const data = (await publicResponse.json()) as {
+      nodes: { id: string; ipv4: string | null; ipv6: string | null }[];
+    };
+    expect(data.nodes.find((n) => n.id === a.node_id)).toMatchObject({
+      ipv4: "192.0.x.x",
+      ipv6: "2001:db8:x:x:x:x:x:x",
+    });
+    const publicText = JSON.stringify(data);
+    expect(publicText).not.toContain("192.0.2.99");
+    expect(publicText).not.toContain("2001:db8:2::88");
+    const privateData = (await (
+      await request("/api/admin/dashboard", "GET", undefined, undefined, {
+        admin: true,
+      })
+    ).json()) as { nodes: { id: string; ipv4: string; ipv6: string }[] };
+    expect(privateData.nodes.find((n) => n.id === a.node_id)).toMatchObject({
+      ipv4: "192.0.2.99",
+      ipv6: "2001:db8:2::88",
+    });
+    await request(
+      `/api/admin/nodes/${a.node_id}/revoke`,
+      "POST",
+      {},
+      undefined,
+      { admin: true },
+    );
+    expect(
+      (
+        await request("/api/agent/v1/addresses", "GET", undefined, a.token, {
+          ip: "192.0.2.100",
+        })
+      ).status,
+    ).toBe(401);
+  });
+  it("preserves real IPv6 when Cloudflare supplies a Pseudo IPv4 hash", async () => {
+    const headers = {
+      "CF-Connecting-IP": "240.1.2.3",
+      "CF-Connecting-IPv6": "2001:db8::99",
+    };
+    expect(connectingAddress(new Request(origin, { headers }))).toBe(
+      "2001:db8::99",
+    );
+    expect(
+      connectingAddress(
+        new Request(origin, {
+          headers: {
+            "CF-Connecting-IP": "192.0.2.9",
+            "CF-Connecting-IPv6": "2001:db8::99",
+          },
+        }),
+      ),
+    ).toBe("192.0.2.9");
+    const a = await create();
+    await request("/api/agent/v1/addresses", "GET", undefined, a.token, {
+      ip: headers["CF-Connecting-IP"],
+      ipv6: headers["CF-Connecting-IPv6"],
+    });
+    expect(
+      await env.DB.prepare("SELECT ipv4,ipv6 FROM nodes WHERE id=?")
+        .bind(a.node_id)
+        .first(),
+    ).toEqual({ ipv4: null, ipv6: "2001:db8::99" });
+  });
   it("masks IPv4, mapped IPv4, compressed IPv6 and rejects non-addresses", () => {
     expect(maskIP("1.2.3.4")).toBe("1.2.3.x");
     expect(maskIP("1.2.3.4", true)).toBe("1.2.x.x");

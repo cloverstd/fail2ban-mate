@@ -6,6 +6,7 @@ import type {
   Ban,
 } from "../shared/protocol";
 import type { Env, NodeRow } from "./env";
+import { splitAddress } from "./addresses";
 
 export async function responseFor(
   env: Env,
@@ -131,11 +132,12 @@ export async function ingest(
     : JSON.parse(node.jails_json);
   const observed = p.snapshot || p.events.length ? now : node.observed_at;
   const g = geo ?? {};
+  const addresses = splitAddress(g.ip);
   sql.push(
     env.DB.prepare(
       `UPDATE nodes SET last_seen=?,observed_at=?,actual_mode=?,fallback_reason=?,version=?,error=?,
     applied_config_revision=?,applied_policy_revision=?,last_seq=MAX(last_seq,?),jails_json=?,
-    ip=COALESCE(?,ip),country=COALESCE(?,country),city=COALESCE(?,city),latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude) WHERE id=?`,
+    ip=COALESCE(?,ip),ipv4=COALESCE(?,ipv4),ipv6=COALESCE(?,ipv6),country=COALESCE(?,country),city=COALESCE(?,city),latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude) WHERE id=?`,
     ).bind(
       now,
       observed,
@@ -147,7 +149,9 @@ export async function ingest(
       p.applied_policy_revision,
       p.sequence,
       JSON.stringify(jailNames),
-      g.ip ?? null,
+      addresses.ipv4 ?? addresses.ipv6,
+      addresses.ipv4,
+      addresses.ipv6,
       g.country ?? null,
       g.city ?? null,
       g.latitude ?? null,

@@ -10,6 +10,8 @@ const fixture: Data = {
       id: "a",
       name: "Singapore · edge-01",
       ip: "192.0.2.9",
+      ipv4: "192.0.2.9",
+      ipv6: "2001:db8:1::9",
       country: "Singapore",
       city: "Singapore",
       latitude: 1.35,
@@ -32,6 +34,8 @@ const fixture: Data = {
       id: "b",
       name: "Frankfurt · edge-02",
       ip: "198.51.100.8",
+      ipv4: "198.51.100.8",
+      ipv6: null,
       country: "Germany",
       city: "Frankfurt",
       latitude: 50.1,
@@ -103,6 +107,8 @@ async function setup(
           nodes: data.nodes.map((n) => ({
             id: n.id,
             ip: n.id === "a" ? "192.0.x.x" : "198.51.x.x",
+            ipv4: n.id === "a" ? "192.0.x.x" : "198.51.x.x",
+            ipv6: n.ipv6 ? "2001:db8:x:x:x:x:x:x" : null,
             country: n.country,
             city: n.city,
             latitude: n.latitude,
@@ -141,6 +147,21 @@ test("public map displays masked data, target links, filters, and offline state"
   await expect(page.getByText("最后已知状态")).toBeVisible();
   await expect(page.getByText("203.0.113.77", { exact: true })).toHaveCount(0);
   await expect(page.getByText("PRIVATE-HOST")).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "管理后台" })).toHaveCount(0);
+  await expect(
+    page.locator('a[href*="admin"], form[action*="admin"]'),
+  ).toHaveCount(0);
+  await expect(page.locator("tbody tr").first()).toContainText("192.0.x.x");
+  await expect(page.locator("tbody tr").first()).toContainText(
+    "2001:db8:x:x:x:x:x:x",
+  );
+  await expect(
+    page.locator(".summary-node").filter({ hasText: "192.0.x.x" }),
+  ).toContainText("2001:db8:x:x:x:x:x:x");
+  await expect(
+    page.locator(".summary-node").filter({ hasText: "198.51.x.x" }),
+  ).toContainText("IPv6未探测到");
+  await expect(page.getByText("2001:db8:1::9", { exact: true })).toHaveCount(0);
   await page.getByLabel("筛选节点").selectOption("a");
   await expect(page.locator("tbody tr")).toHaveCount(2);
   await page.getByLabel("搜索 IP 或城市").fill("Beijing");
@@ -155,7 +176,7 @@ test("node creation generates a one-time installation command", async ({
   page,
 }) => {
   await setup(page, true);
-  await page.goto("/admin");
+  await page.goto("/admin/");
   await page.getByRole("button", { name: "节点管理", exact: true }).click();
   await page.getByRole("button", { name: "添加节点", exact: true }).click();
   await page.getByLabel("节点名称").fill("Tokyo");
@@ -169,7 +190,7 @@ test("ban, release, and permanent global whitelist submit correct targets", asyn
   page,
 }) => {
   await setup(page, true);
-  await page.goto("/admin");
+  await page.goto("/admin/");
   await page.getByRole("button", { name: "封禁列表", exact: true }).click();
   await page.getByRole("button", { name: "手动封禁", exact: true }).click();
   await page.getByLabel("IP 地址", { exact: true }).fill("8.8.8.8");

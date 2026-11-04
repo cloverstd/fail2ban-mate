@@ -225,6 +225,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.scan(ctx); err != nil {
 		return err
 	}
+	addressCtx, stopAddresses := context.WithCancel(ctx)
+	addressesDone := make(chan struct{})
+	go func() {
+		defer close(addressesDone)
+		monitorAddresses(addressCtx, a.Config.Server, a.Config.Token, a.Version)
+	}()
+	defer func() {
+		stopAddresses()
+		<-addressesDone
+	}()
 	events := make(chan netEvent, 64)
 	emit := func(e netEvent) {
 		select {

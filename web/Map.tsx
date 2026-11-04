@@ -6,6 +6,7 @@ import type { Topology, GeometryCollection } from "topojson-specification";
 import type { FeatureCollection } from "geojson";
 import { Minus, Plus, RotateCcw } from "lucide-react";
 import type { BanRow, Node } from "./types";
+import { nodeAddressLabel } from "./NodeAddresses";
 
 const countries = feature(
   world as unknown as Topology,
@@ -117,7 +118,7 @@ export function WorldMap({ nodes, bans }: { nodes: Node[]; bans: BanRow[] }) {
               <circle cx={from[0]} cy={from[1]} r="3" className="source-dot">
                 <title>
                   {b.ip} · {b.city || b.country || "未知位置"} →{" "}
-                  {n.name || n.ip}
+                  {n.name || nodeAddressLabel(n)}
                 </title>
               </circle>
             </g>
@@ -136,7 +137,8 @@ export function WorldMap({ nodes, bans }: { nodes: Node[]; bans: BanRow[] }) {
                   strokeWidth="1.5"
                 >
                   <title>
-                    {n.name || n.ip} · {n.city || n.country || "未知位置"} ·{" "}
+                    {n.name || nodeAddressLabel(n)} ·{" "}
+                    {n.city || n.country || "未知位置"} ·{" "}
                     {n.online ? "在线" : "离线"}
                   </title>
                 </circle>

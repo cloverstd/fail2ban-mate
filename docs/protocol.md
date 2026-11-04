@@ -14,6 +14,8 @@ agent API 使用 `Authorization: Bearer <64 位十六进制 token>`。每个 tok
 
 Go 类型位于 `client/internal/mate/protocol.go`，服务端验证位于 `worker/validation.ts`。时间均为 Unix 秒。HTTP `POST /api/agent/v1/sync` 与 `GET /api/agent/v1/ws` 升级后的 JSON 消息使用相同协议。
 
+`GET /api/agent/v1/addresses` 同样要求节点 token，仅使用 Cloudflare 的连接地址更新该节点的 `ipv4` 或 `ipv6`，返回本次观测的 `{ipv4,ipv6}`。它不接受客户端声明的 IP、不更新心跳和快照时间，也不清除另一地址族的历史记录。v0.1.1 客户端在独立后台任务中，启动时及每 5 分钟分别使用 `tcp4`、`tcp6` 探测；每次最多 5 秒，不跟随重定向，缺少任一地址族不影响同步。保留系统代理配置，使用代理时记录实际到达控制端的出口地址。
+
 客户端发送 `protocol: 1`、`type: "sync"`，以及：
 
 | 字段                              | 含义                                                                                                         |

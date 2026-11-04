@@ -27,9 +27,14 @@ import {
 import type { Mode } from "../shared/protocol";
 import type { BanRow, Data, Node } from "./types";
 import { WorldMap } from "./Map";
+import { NodeAddresses, nodeAddressLabel } from "./NodeAddresses";
 import "./style.css";
 
-const admin = location.pathname.startsWith("/admin");
+// Production builds expose only the URLs needed by their audience.
+declare const __ADMIN__: boolean;
+const admin = import.meta.env.DEV
+  ? location.pathname.startsWith("/admin")
+  : __ADMIN__;
 const empty: Data = { nodes: [], bans: [], generated_at: 0 };
 const time = (t: number | null | undefined) =>
   t
@@ -176,7 +181,7 @@ function App() {
   const key = (b: BanRow) => `${b.node_id}|${b.jail}|${b.ip}`;
   const nodeName = (id: string) => {
     const n = data.nodes.find((n) => n.id === id);
-    return n?.name || n?.ip || "未知节点";
+    return n?.name || (n ? nodeAddressLabel(n) : "未知节点");
   };
   const filtered = data.bans.filter(
     (b) =>
@@ -247,7 +252,7 @@ function App() {
           <option value="">所有节点</option>
           {data.nodes.map((n) => (
             <option key={n.id} value={n.id}>
-              {n.name || n.ip}
+              {n.name || nodeAddressLabel(n)}
             </option>
           ))}
         </select>
@@ -350,7 +355,13 @@ function App() {
                 </td>
                 <td>{place(b)}</td>
                 <td>
-                  <span className="node-cell">{nodeName(b.node_id)}</span>
+                  {admin ? (
+                    <span className="node-cell">{nodeName(b.node_id)}</span>
+                  ) : (
+                    <NodeAddresses
+                      node={data.nodes.find((n) => n.id === b.node_id)}
+                    />
+                  )}
                   {!data.nodes.find((n) => n.id === b.node_id)?.online && (
                     <small className="stale">最后已知状态</small>
                   )}
@@ -442,10 +453,12 @@ function App() {
             GitHub
             <ExternalLink size={13} />
           </a>
-          <a className="btn small" href={admin ? "/" : "/admin"}>
-            {admin ? <Globe2 size={15} /> : <LockKeyhole size={15} />}
-            <span>{admin ? "公开看板" : "管理后台"}</span>
-          </a>
+          {admin && (
+            <a className="btn small" href="/">
+              <Globe2 size={15} />
+              <span>公开看板</span>
+            </a>
+          )}
         </div>
       </header>
       <div className={admin ? "app-shell" : "public-shell"}>
@@ -650,7 +663,8 @@ function App() {
                     >
                       <i className={n.online ? "live-dot" : "offline-dot"} />
                       <span>
-                        <code>{n.name || n.ip}</code>
+                        {n.name && <code>{n.name}</code>}
+                        <NodeAddresses node={n} />
                         <small>{place(n)}</small>
                       </span>
                       <span className="node-ban-count">
@@ -668,7 +682,7 @@ function App() {
                     <span>
                       {admin
                         ? "节点完整信息仅管理员可见"
-                        : "来源 IP 隐藏末段，节点 IP 仅保留前两段"}
+                        : "节点 IPv4 保留前两段，IPv6 保留前两组"}
                     </span>
                   </div>
                 </section>
@@ -687,7 +701,7 @@ function App() {
                     </span>
                     <div>
                       <h2>{n.name}</h2>
-                      <code className="muted">{n.ip || "等待注册"}</code>
+                      <NodeAddresses node={n} />
                     </div>
                     <span className={`badge ${n.online ? "success" : ""}`}>
                       <i className={n.online ? "live-dot" : "offline-dot"} />
@@ -1070,7 +1084,7 @@ function App() {
           </footer>
         </main>
       </div>
-      {modal && (
+      {admin && modal && (
         <Dialog
           modal={modal}
           nodes={data.nodes}

@@ -27,6 +27,8 @@ export interface NodeRow {
   error: string | null;
   jails_json: string;
   ip: string | null;
+  ipv4: string | null;
+  ipv6: string | null;
   country: string | null;
   city: string | null;
   latitude: number | null;

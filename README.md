@@ -14,10 +14,12 @@
 
 公开页面仅返回脱敏 IP：来源 IPv4 `1.2.3.x`、节点 IPv4 `1.2.x.x`；IPv6 来源保留前三组，节点保留前两组。完整 IP 仅在后台可见。地图数据随网页分发，无地图 API 或第三方瓦片请求。
 
+节点的 IPv4、IPv6 分别记录，在公开列表、节点卡片和地图提示中同时显示并打码。客户端 v0.1.1 起，在启动时及每 5 分钟通过两种地址族连接控制端，由服务端确认实际出口地址；没有可用路由或尚未探测到的地址族显示「未探测到」。旧客户端仍会自动记录当前连接使用的地址族，升级后补齐另一种地址。探测失败不影响正常同步。
+
 ## 当前部署
 
 - 公开看板：[fail2ban.cloverstd.com](https://fail2ban.cloverstd.com)
-- 管理后台：[进入后台](https://fail2ban.cloverstd.com/admin)，通过 Cloudflare Access 的 GitHub 身份提供商登录，仅允许 `cloverstd@gmail.com`。
+- 管理后台通过 Cloudflare Access 的 GitHub 身份提供商登录，仅允许 `cloverstd@gmail.com`。公开看板不提供后台入口，公开页面的 HTML 和 JavaScript 不包含后台 URL；后台资源单独构建并由 Access 保护。
 - 默认 `workers.dev` 域名和预览地址均已关闭，配置保存在 `wrangler.jsonc`，后续部署继续生效。
 - 服务端 CI：Cloudflare Workers Builds 连接本仓库 `main`，负责检查、构建、D1 迁移和部署；非生产分支构建已关闭。
 - Access 使用现有团队 `cloverstd.cloudflareaccess.com`，仅保护后台页面和管理 API，公开页面与 agent 接口保持公开路由。

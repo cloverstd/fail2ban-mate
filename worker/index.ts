@@ -10,6 +10,7 @@ import {
   whitelistSchema,
 } from "./validation";
 import { maskIP } from "./privacy";
+import { connectingAddress, nodeAddresses, splitAddress } from "./addresses";
 import { notifyDashboard, wakeNode, wakeAll } from "./sync";
 export { NodeConnection, Dashboard } from "./connections";
 
@@ -41,6 +42,7 @@ function nodeView(n: NodeRow) {
   } = n as NodeRow & { enroll_hash?: string; enroll_expires?: number };
   return {
     ...rest,
+    ...nodeAddresses(n),
     jails: JSON.parse(n.jails_json),
     has_token: !!token_hash,
     online:
@@ -95,12 +97,14 @@ app.get("/api/public/dashboard", async (c) => {
   if (hit) return hit;
   const [nodes, bans] = await Promise.all([
     c.env.DB.prepare(
-      "SELECT id,ip,country,city,latitude,longitude,last_seen,observed_at,poll_interval,(token_hash IS NOT NULL) AS authenticated FROM nodes WHERE enabled=1",
+      "SELECT id,ip,ipv4,ipv6,country,city,latitude,longitude,last_seen,observed_at,poll_interval,(token_hash IS NOT NULL) AS authenticated FROM nodes WHERE enabled=1",
     ).all<
       Pick<
         NodeRow,
         | "id"
         | "ip"
+        | "ipv4"
+        | "ipv6"
         | "country"
         | "city"
         | "latitude"
@@ -129,6 +133,12 @@ app.get("/api/public/dashboard", async (c) => {
       nodes: nodes.results.map((n) => ({
         id: n.id,
         ip: maskIP(n.ip, true),
+        ipv4: nodeAddresses(n).ipv4
+          ? maskIP(nodeAddresses(n).ipv4, true)
+          : null,
+        ipv6: nodeAddresses(n).ipv6
+          ? maskIP(nodeAddresses(n).ipv6, true)
+          : null,
         country: n.country,
         city: n.city,
         latitude: n.latitude,
@@ -382,6 +392,22 @@ app.post("/api/agent/v1/enroll", async (c) => {
   await wakeNode(c.env, row.id, true);
   return c.json({ node_id: row.id, token, protocol: 1 });
 });
+app.get("/api/agent/v1/addresses", async (c) => {
+  const n = await agent(c.req.raw, c.env);
+  if (!n) return c.json({ error: "节点凭据无效或已停用" }, 401);
+  const addresses = splitAddress(connectingAddress(c.req.raw));
+  if (!addresses.ipv4 && !addresses.ipv6)
+    return c.json({ error: "无法识别连接地址" }, 503);
+  const result = await c.env.DB.prepare(
+    "UPDATE nodes SET ipv4=COALESCE(?,ipv4),ipv6=COALESCE(?,ipv6) WHERE id=? AND token_hash=? AND enabled=1",
+  )
+    .bind(addresses.ipv4, addresses.ipv6, n.id, n.token_hash)
+    .run();
+  if (!result.meta.changes)
+    return c.json({ error: "节点凭据无效或已停用" }, 401);
+  c.executionCtx.waitUntil(notifyDashboard(c.env));
+  return c.json(addresses);
+});
 app.all("/api/agent/v1/:action", async (c) => {
   const action = c.req.param("action");
   if (!["sync", "ws"].includes(action))
@@ -395,7 +421,7 @@ app.all("/api/agent/v1/:action", async (c) => {
   if (!n) return c.json({ error: "节点凭据无效或已停用" }, 401);
   const cf = c.req.raw.cf;
   const geo = {
-    ip: c.req.header("CF-Connecting-IP") ?? null,
+    ip: connectingAddress(c.req.raw),
     country: cf?.country ?? null,
     city: cf?.city ?? null,
     latitude: cf?.latitude ? Number(cf.latitude) : null,
@@ -414,7 +440,15 @@ app.all("/api/agent/v1/:action", async (c) => {
   );
 });
 app.all("/api/*", (c) => c.json({ error: "接口不存在" }, 404));
-app.get("*", (c) => c.env.ASSETS.fetch(c.req.raw));
+app.get("*", (c) => {
+  if (c.req.path === "/admin" || c.req.path.startsWith("/admin/")) {
+    const url = new URL(c.req.url);
+    // Keep the authenticated application's assets behind the same Access paths.
+    if (!c.req.path.startsWith("/admin/assets/")) url.pathname = "/admin/";
+    return c.env.ASSETS.fetch(new Request(url, c.req.raw));
+  }
+  return c.env.ASSETS.fetch(c.req.raw);
+});
 export async function cleanup(env: Env): Promise<void> {
   const days = Math.min(3650, Math.max(1, Number(env.RETENTION_DAYS) || 30));
   const cutoff = now() - days * 86400;

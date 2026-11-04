@@ -3,6 +3,8 @@ export interface Node extends Geo {
   id: string;
   name?: string;
   ip: string | null;
+  ipv4?: string | null;
+  ipv6?: string | null;
   online: boolean;
   last_seen: number | null;
   observed_at: number | null;
