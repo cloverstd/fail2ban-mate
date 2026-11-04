@@ -94,7 +94,11 @@ app.get("/api/public/dashboard", async (c) => {
   const cache = (caches as unknown as { default: Cache }).default;
   const key = new Request(c.req.url);
   const hit = await cache.match(key);
-  if (hit) return hit;
+  if (hit) {
+    const response = new Response(hit.body, hit);
+    response.headers.set("Cache-Control", "no-store");
+    return response;
+  }
   const [nodes, bans] = await Promise.all([
     c.env.DB.prepare(
       "SELECT id,ip,ipv4,ipv6,country,city,latitude,longitude,last_seen,observed_at,poll_interval,(token_hash IS NOT NULL) AS authenticated FROM nodes WHERE enabled=1",
@@ -163,12 +167,15 @@ app.get("/api/public/dashboard", async (c) => {
     },
     {
       headers: {
-        "Cache-Control": "public, max-age=10",
+        "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
       },
     },
   );
-  c.executionCtx.waitUntil(cache.put(key, response.clone()));
+  // Cache only at the edge. Zone Browser Cache TTL can lengthen max-age on hits.
+  const cached = response.clone();
+  cached.headers.set("Cache-Control", "public, max-age=10");
+  c.executionCtx.waitUntil(cache.put(key, cached));
   return response;
 });
 app.get("/api/admin/dashboard", async (c) => {

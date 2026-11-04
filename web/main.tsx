@@ -99,6 +99,7 @@ function App() {
     try {
       const res = await fetch(
         admin ? "/api/admin/dashboard" : "/api/public/dashboard",
+        { cache: "no-store" },
       );
       const body = (await res.json()) as Data & { error?: string };
       if (!res.ok) throw new Error(body.error || "暂时无法连接控制端");

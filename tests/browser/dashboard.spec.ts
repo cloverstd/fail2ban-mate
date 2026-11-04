@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { createServer } from "node:http";
 import type { Data } from "../../web/types";
 const now = Math.floor(Date.now() / 1000);
 const fixture: Data = {
@@ -171,6 +172,71 @@ test("public map displays masked data, target links, filters, and offline state"
     "transform",
     /scale\(1.4\)/,
   );
+});
+test("public refresh and polling bypass long-lived browser cache", async ({
+  page,
+  baseURL,
+}) => {
+  let count = 1;
+  let requests = 0;
+  // Playwright routing disables HTTP caching, so use a real HTTP fixture here.
+  const server = createServer((req, res) => {
+    void (async () => {
+      if (req.url === "/api/public/dashboard") {
+        requests++;
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, max-age=14400",
+        });
+        res.end(
+          JSON.stringify({
+            ...fixture,
+            generated_at: now + count,
+            bans: fixture.bans.slice(0, count),
+          }),
+        );
+        return;
+      }
+      const upstream = await fetch(new URL(req.url ?? "/", baseURL));
+      res.writeHead(upstream.status, {
+        "Content-Type":
+          upstream.headers.get("Content-Type") ?? "application/octet-stream",
+        "Cache-Control": "no-store",
+      });
+      res.end(Buffer.from(await upstream.arrayBuffer()));
+    })().catch((error) => {
+      res.writeHead(500);
+      res.end(String(error));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No port");
+    await page.clock.install();
+    await page.goto(`http://127.0.0.1:${address.port}/`);
+    const total = page.locator(".stat").filter({ hasText: "当前封禁" });
+    await expect(page.locator("tbody tr")).toHaveCount(1);
+    await expect(total.locator("strong")).toHaveText("1");
+
+    count = 2;
+    await page.getByRole("button", { name: "刷新", exact: true }).click();
+    await expect(page.locator("tbody tr")).toHaveCount(2);
+    await expect(total.locator("strong")).toHaveText("2");
+
+    count = 3;
+    const beforePoll = requests;
+    await page.clock.fastForward(10_000);
+    await expect(page.locator("tbody tr")).toHaveCount(3);
+    await expect(total.locator("strong")).toHaveText("3");
+    expect(requests).toBeGreaterThan(beforePoll);
+  } finally {
+    await page.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });
 test("node creation generates a one-time installation command", async ({
   page,

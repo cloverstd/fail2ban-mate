@@ -542,6 +542,46 @@ describe("sync and commands", () => {
   });
 });
 describe("public privacy", () => {
+  it("keeps dashboard snapshots at the edge without caching them in browsers", async () => {
+    const a = await create();
+    await env.DB.prepare(
+      "INSERT INTO bans(node_id,jail,ip,observed_at) VALUES(?,?,?,?)",
+    )
+      .bind(a.node_id, "sshd", "203.0.113.77", 100)
+      .run();
+    const path = "/api/public/dashboard?cache-test=" + crypto.randomUUID();
+    const key = new Request(origin + path);
+    const cache = (caches as unknown as { default: Cache }).default;
+    try {
+      const first = await request(path);
+      expect(first.headers.get("Cache-Control")).toBe("no-store");
+      expect(await first.json()).toMatchObject({
+        bans: [{ ip: "203.0.113.x" }],
+      });
+      const stored = await cache.match(key);
+      expect(stored?.headers.get("Cache-Control")).toBe("public, max-age=10");
+
+      await env.DB.prepare(
+        "INSERT INTO bans(node_id,jail,ip,observed_at) VALUES(?,?,?,?)",
+      )
+        .bind(a.node_id, "sshd", "198.51.100.88", 101)
+        .run();
+      const warm = await request(path);
+      expect(warm.headers.get("Cache-Control")).toBe("no-store");
+      expect((await warm.json<{ bans: unknown[] }>()).bans).toHaveLength(1);
+      // Serving the hit must not change the cached response's edge TTL.
+      expect((await cache.match(key))?.headers.get("Cache-Control")).toBe(
+        "public, max-age=10",
+      );
+
+      await cache.delete(key);
+      const fresh = await request(path);
+      expect(fresh.headers.get("Cache-Control")).toBe("no-store");
+      expect((await fresh.json<{ bans: unknown[] }>()).bans).toHaveLength(2);
+    } finally {
+      await cache.delete(key);
+    }
+  });
   it("records both observed address families without overwriting one with the other", async () => {
     const a = await create();
     const b = await create("other-node");
