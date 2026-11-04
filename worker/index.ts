@@ -92,7 +92,10 @@ app.use("/api/admin/*", async (c, next) => {
 });
 app.get("/api/public/dashboard", async (c) => {
   const cache = (caches as unknown as { default: Cache }).default;
-  const key = new Request(c.req.url);
+  const cacheURL = new URL(c.req.url);
+  // Version the public projection so older snapshots cannot expose service names.
+  cacheURL.searchParams.set("__public_schema", "2");
+  const key = new Request(cacheURL);
   const hit = await cache.match(key);
   if (hit) {
     const response = new Response(hit.body, hit);
@@ -119,10 +122,9 @@ app.get("/api/public/dashboard", async (c) => {
       > & { authenticated: number }
     >(),
     c.env.DB.prepare(
-      "SELECT b.* FROM bans b JOIN nodes n ON b.node_id=n.id WHERE n.enabled=1 ORDER BY b.observed_at DESC LIMIT 20000",
+      "SELECT b.node_id,b.ip,b.country,b.city,b.latitude,b.longitude,b.observed_at FROM bans b JOIN nodes n ON b.node_id=n.id WHERE n.enabled=1 ORDER BY b.observed_at DESC LIMIT 20000",
     ).all<{
       node_id: string;
-      jail: string;
       ip: string;
       country: string | null;
       city: string | null;
@@ -156,7 +158,6 @@ app.get("/api/public/dashboard", async (c) => {
       })),
       bans: bans.results.map((b) => ({
         node_id: b.node_id,
-        jail: b.jail,
         ip: maskIP(b.ip),
         country: b.country,
         city: b.city,

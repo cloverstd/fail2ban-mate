@@ -550,14 +550,27 @@ describe("public privacy", () => {
       .bind(a.node_id, "sshd", "203.0.113.77", 100)
       .run();
     const path = "/api/public/dashboard?cache-test=" + crypto.randomUUID();
-    const key = new Request(origin + path);
+    const legacyKey = new Request(origin + path);
+    const cacheURL = new URL(origin + path);
+    cacheURL.searchParams.set("__public_schema", "2");
+    const key = new Request(cacheURL);
     const cache = (caches as unknown as { default: Cache }).default;
     try {
+      await cache.put(
+        legacyKey,
+        Response.json(
+          { bans: [{ jail: "private-service" }] },
+          {
+            headers: { "Cache-Control": "public, max-age=10" },
+          },
+        ),
+      );
       const first = await request(path);
       expect(first.headers.get("Cache-Control")).toBe("no-store");
-      expect(await first.json()).toMatchObject({
-        bans: [{ ip: "203.0.113.x" }],
-      });
+      const firstData = await first.json<{ bans: Record<string, unknown>[] }>();
+      expect(firstData).toMatchObject({ bans: [{ ip: "203.0.113.x" }] });
+      expect(firstData.bans[0]).not.toHaveProperty("jail");
+      expect(JSON.stringify(firstData)).not.toMatch(/sshd|private-service/);
       const stored = await cache.match(key);
       expect(stored?.headers.get("Cache-Control")).toBe("public, max-age=10");
 
@@ -568,7 +581,10 @@ describe("public privacy", () => {
         .run();
       const warm = await request(path);
       expect(warm.headers.get("Cache-Control")).toBe("no-store");
-      expect((await warm.json<{ bans: unknown[] }>()).bans).toHaveLength(1);
+      const warmData = await warm.json<{ bans: Record<string, unknown>[] }>();
+      expect(warmData.bans).toHaveLength(1);
+      expect(warmData.bans[0]).not.toHaveProperty("jail");
+      expect(JSON.stringify(warmData)).not.toMatch(/sshd|private-service/);
       // Serving the hit must not change the cached response's edge TTL.
       expect((await cache.match(key))?.headers.get("Cache-Control")).toBe(
         "public, max-age=10",
@@ -580,6 +596,7 @@ describe("public privacy", () => {
       expect((await fresh.json<{ bans: unknown[] }>()).bans).toHaveLength(2);
     } finally {
       await cache.delete(key);
+      await cache.delete(legacyKey);
     }
   });
   it("records both observed address families without overwriting one with the other", async () => {
@@ -732,6 +749,8 @@ describe("public privacy", () => {
       a.token,
       "token_hash",
       "enroll_hash",
+      "sshd",
+      "jail",
     ])
       expect(text).not.toContain(value);
     expect(text).toContain("203.0.113.x");

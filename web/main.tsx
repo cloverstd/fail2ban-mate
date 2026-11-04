@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import type { Mode } from "../shared/protocol";
-import type { BanRow, Data, Node } from "./types";
+import type { BanRow, Data, Node, PublicData } from "./types";
 import { WorldMap } from "./Map";
 import { NodeAddresses, nodeAddressLabel } from "./NodeAddresses";
 import "./style.css";
@@ -80,6 +80,89 @@ async function api<T = unknown>(
   if (!res.ok) throw new Error(json.error || `请求失败 (${res.status})`);
   return json as T;
 }
+function PublicApp() {
+  const [data, setData] = useState<PublicData>(empty);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const response = await fetch("/api/public/dashboard", {
+        cache: "no-store",
+      });
+      const body = (await response.json()) as PublicData & { error?: string };
+      if (!response.ok) throw new Error(body.error || "暂时无法连接控制端");
+      setData(body);
+      setError("");
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 10000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  return (
+    <div className="public-app">
+      <header className="topbar">
+        <a className="brand" href="/">
+          <span className="brand-mark">
+            <Shield size={22} />
+          </span>
+          <span>
+            fail2ban<span className="brand-light"> mate</span>
+          </span>
+          <span className="version">v0.1</span>
+        </a>
+        <div className="top-actions">
+          <span className="network-status" role="status">
+            <i className={error ? "status-error" : "live-dot"} />
+            {error ? "连接异常" : loading ? "正在同步" : "防护网络"}
+          </span>
+          <span className="last-update">
+            更新于{" "}
+            {data.generated_at
+              ? new Date(data.generated_at * 1000).toLocaleTimeString("zh-CN", {
+                  hour12: false,
+                })
+              : "—"}
+          </span>
+          <button
+            className="icon-btn"
+            aria-label="刷新"
+            disabled={refreshing}
+            onClick={() => void refresh()}
+          >
+            <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+          </button>
+          <a
+            className="subtle-link"
+            href="https://github.com/cloverstd/fail2ban-mate"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub <ExternalLink size={13} />
+          </a>
+        </div>
+      </header>
+      <main className="public-map">
+        <WorldMap
+          nodes={data.nodes}
+          bans={data.bans}
+          publicView
+          loading={loading}
+          error={error}
+          onRetry={() => void refresh()}
+        />
+      </main>
+    </div>
+  );
+}
 function App() {
   const [data, setData] = useState<Data>(empty),
     [page, setPage] = useState<Page>("overview"),
@@ -97,10 +180,7 @@ function App() {
     [modal, setModal] = useState<Modal | null>(null);
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch(
-        admin ? "/api/admin/dashboard" : "/api/public/dashboard",
-        { cache: "no-store" },
-      );
+      const res = await fetch("/api/admin/dashboard", { cache: "no-store" });
       const body = (await res.json()) as Data & { error?: string };
       if (!res.ok) throw new Error(body.error || "暂时无法连接控制端");
       setData(body);
@@ -1412,7 +1492,5 @@ function Dialog({
   );
 }
 createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
+  <React.StrictMode>{admin ? <App /> : <PublicApp />}</React.StrictMode>,
 );

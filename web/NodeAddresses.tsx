@@ -1,6 +1,8 @@
 import type { Node } from "./types";
 
-function addresses(node?: Node) {
+type AddressNode = Pick<Node, "ip" | "ipv4" | "ipv6">;
+
+function addresses(node?: AddressNode) {
   return {
     ipv4:
       node?.ipv4 ??
@@ -9,27 +11,25 @@ function addresses(node?: Node) {
   };
 }
 
-export function nodeAddressLabel(node: Node): string {
+export function nodeAddressLabel(node: AddressNode): string {
   const { ipv4, ipv6 } = addresses(node);
-  return (
-    [ipv4 && `IPv4 ${ipv4}`, ipv6 && `IPv6 ${ipv6}`]
-      .filter(Boolean)
-      .join(" · ") || "未知节点"
-  );
+  return [ipv4, ipv6].filter(Boolean).join(" · ") || "未知 IP";
 }
 
-export function NodeAddresses({ node }: { node?: Node }) {
+export function NodeAddresses({ node }: { node?: AddressNode }) {
   const { ipv4, ipv6 } = addresses(node);
   return (
     <span className="node-addresses">
-      <span>
-        <span className="address-family">IPv4</span>
-        <code>{ipv4 || "未探测到"}</code>
-      </span>
-      <span>
-        <span className="address-family">IPv6</span>
-        <code>{ipv6 || "未探测到"}</code>
-      </span>
+      {[ipv4, ipv6].filter(Boolean).map((ip) => (
+        <span key={ip}>
+          <code>{ip}</code>
+        </span>
+      ))}
+      {!ipv4 && !ipv6 && (
+        <span>
+          <code>未知 IP</code>
+        </span>
+      )}
     </span>
   );
 }

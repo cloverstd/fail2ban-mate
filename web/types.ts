@@ -21,11 +21,29 @@ export interface Node extends Geo {
   version?: string;
   error?: string;
 }
-export interface BanRow extends Geo {
+export type PublicNode = Pick<
+  Node,
+  | keyof Geo
+  | "id"
+  | "ip"
+  | "ipv4"
+  | "ipv6"
+  | "online"
+  | "last_seen"
+  | "observed_at"
+>;
+export interface PublicBanRow extends Geo {
   node_id: string;
-  jail: string;
   ip: string;
   observed_at: number;
+}
+export interface BanRow extends PublicBanRow {
+  jail: string;
+}
+export interface PublicData {
+  nodes: PublicNode[];
+  bans: PublicBanRow[];
+  generated_at: number;
 }
 export interface PolicyRow {
   id: string;

@@ -1,6 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import { createServer } from "node:http";
-import type { Data } from "../../web/types";
+import type { Data, PublicData } from "../../web/types";
+import { maskIP } from "../../worker/privacy";
 const now = Math.floor(Date.now() / 1000);
 const fixture: Data = {
   generated_at: now,
@@ -92,6 +93,38 @@ const fixture: Data = {
   commands: [],
   audit: [],
 };
+function publicFixture(data: Data): PublicData {
+  return {
+    generated_at: data.generated_at,
+    nodes: data.nodes.map((node) => ({
+      id: node.id,
+      ip: maskIP(node.ip, true),
+      ipv4:
+        node.ipv4 === undefined
+          ? undefined
+          : node.ipv4
+            ? maskIP(node.ipv4, true)
+            : null,
+      ipv6:
+        node.ipv6 === undefined
+          ? undefined
+          : node.ipv6
+            ? maskIP(node.ipv6, true)
+            : null,
+      country: node.country,
+      city: node.city,
+      latitude: node.latitude,
+      longitude: node.longitude,
+      online: node.online,
+      last_seen: node.last_seen,
+      observed_at: node.observed_at,
+    })),
+    bans: data.bans.map(({ jail: _jail, ...ban }) => ({
+      ...ban,
+      ip: maskIP(ban.ip),
+    })),
+  };
+}
 async function setup(
   page: Page,
   admin = false,
@@ -103,24 +136,7 @@ async function setup(
       u = new URL(req.url());
     if (req.method() === "GET") {
       if (!admin) {
-        const publicData = {
-          generated_at: data.generated_at,
-          nodes: data.nodes.map((n) => ({
-            id: n.id,
-            ip: n.id === "a" ? "192.0.x.x" : "198.51.x.x",
-            ipv4: n.id === "a" ? "192.0.x.x" : "198.51.x.x",
-            ipv6: n.ipv6 ? "2001:db8:x:x:x:x:x:x" : null,
-            country: n.country,
-            city: n.city,
-            latitude: n.latitude,
-            longitude: n.longitude,
-            online: n.online,
-            last_seen: n.last_seen,
-            observed_at: n.observed_at,
-          })),
-          bans: data.bans.map((b) => ({ ...b, ip: "203.0.113.x" })),
-        };
-        return route.fulfill({ json: publicData });
+        return route.fulfill({ json: publicFixture(data) });
       }
       return route.fulfill({ json: data });
     }
@@ -136,42 +152,46 @@ async function setup(
     });
   });
 }
-test("public map displays masked data, target links, filters, and offline state", async ({
+test("public page contains only navigation and the map with private fields removed", async ({
   page,
 }) => {
   await setup(page);
   await page.goto("/");
-  await expect(
-    page.getByRole("heading", { name: "全球防护，实时可见" }),
-  ).toBeVisible();
   await expect(page.locator(".connection")).toHaveCount(3);
-  await expect(page.getByText("最后已知状态")).toBeVisible();
-  await expect(page.getByText("203.0.113.77", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("PRIVATE-HOST")).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "管理后台" })).toHaveCount(0);
+  await expect(
+    page.locator(
+      ".stats, .page-heading, .node-summary, .filters, table, footer",
+    ),
+  ).toHaveCount(0);
   await expect(
     page.locator('a[href*="admin"], form[action*="admin"]'),
   ).toHaveCount(0);
-  await expect(page.locator("tbody tr").first()).toContainText("192.0.x.x");
-  await expect(page.locator("tbody tr").first()).toContainText(
-    "2001:db8:x:x:x:x:x:x",
+  await page.getByRole("button", { name: /^受保护节点 192\.0/ }).click();
+  const popup = page.getByRole("dialog", { name: "地图节点信息" });
+  await expect(popup).toContainText("192.0.x.x");
+  await expect(popup).toContainText("2001:db8:x:x:x:x:x:x");
+  await expect(popup).toContainText("在线");
+  await expect(popup).toContainText("最近上报");
+  await expect(popup).not.toContainText(/IPv4|IPv6|未探测到/);
+  await page.getByRole("button", { name: "关闭节点信息" }).click();
+  await expect(popup).toHaveCount(0);
+  await page.getByRole("button", { name: /^受保护节点 198\.51/ }).click();
+  await expect(popup).toContainText("离线 · 最后已知状态");
+  await expect(popup.locator(".node-addresses code")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await page
+    .getByRole("button", { name: /^封禁来源/ })
+    .first()
+    .click();
+  await expect(popup).toContainText("203.0.113.x");
+  await expect(popup).toContainText("目标节点");
+  await expect(popup).toContainText("观测时间");
+  await expect(page.locator("body")).not.toContainText(
+    /203\.0\.113\.77|192\.0\.2\.9|2001:db8:1::9|edge-01|sshd|nginx-auth|Service/,
   );
   await expect(
-    page.locator(".summary-node").filter({ hasText: "192.0.x.x" }),
-  ).toContainText("2001:db8:x:x:x:x:x:x");
-  await expect(
-    page.locator(".summary-node").filter({ hasText: "198.51.x.x" }),
-  ).toContainText("IPv6未探测到");
-  await expect(page.getByText("2001:db8:1::9", { exact: true })).toHaveCount(0);
-  await page.getByLabel("筛选节点").selectOption("a");
-  await expect(page.locator("tbody tr")).toHaveCount(2);
-  await page.getByLabel("搜索 IP 或城市").fill("Beijing");
-  await expect(page.locator("tbody tr")).toHaveCount(1);
-  await page.getByRole("button", { name: "放大地图" }).click();
-  await expect(page.locator(".world-map>g")).toHaveAttribute(
-    "transform",
-    /scale\(1.4\)/,
-  );
+    page.getByRole("link", { name: "IP Geolocation by DB-IP" }),
+  ).toBeVisible();
 });
 test("public refresh and polling bypass long-lived browser cache", async ({
   page,
@@ -190,9 +210,9 @@ test("public refresh and polling bypass long-lived browser cache", async ({
         });
         res.end(
           JSON.stringify({
-            ...fixture,
+            ...publicFixture(fixture),
             generated_at: now + count,
-            bans: fixture.bans.slice(0, count),
+            bans: publicFixture(fixture).bans.slice(0, count),
           }),
         );
         return;
@@ -215,20 +235,16 @@ test("public refresh and polling bypass long-lived browser cache", async ({
     if (!address || typeof address === "string") throw new Error("No port");
     await page.clock.install();
     await page.goto(`http://127.0.0.1:${address.port}/`);
-    const total = page.locator(".stat").filter({ hasText: "当前封禁" });
-    await expect(page.locator("tbody tr")).toHaveCount(1);
-    await expect(total.locator("strong")).toHaveText("1");
+    await expect(page.locator(".connection")).toHaveCount(1);
 
     count = 2;
     await page.getByRole("button", { name: "刷新", exact: true }).click();
-    await expect(page.locator("tbody tr")).toHaveCount(2);
-    await expect(total.locator("strong")).toHaveText("2");
+    await expect(page.locator(".connection")).toHaveCount(2);
 
     count = 3;
     const beforePoll = requests;
     await page.clock.fastForward(10_000);
-    await expect(page.locator("tbody tr")).toHaveCount(3);
-    await expect(total.locator("strong")).toHaveText("3");
+    await expect(page.locator(".connection")).toHaveCount(3);
     expect(requests).toBeGreaterThan(beforePoll);
   } finally {
     await page.close();
@@ -295,9 +311,8 @@ test("mobile layout and empty/unknown geography states remain usable", async ({
   await setup(page, false, { ...structuredClone(fixture), bans: [] });
   await page.goto("/");
   await expect(page.getByText("防护网络已就绪")).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "暂无封禁记录" }),
-  ).toBeVisible();
+  await expect(page.locator("table")).toHaveCount(0);
+  await expectViewportMap(page);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
@@ -315,9 +330,278 @@ test("desktop map preview has no runtime errors", async ({ page }) => {
   await setup(page);
   await page.goto("/");
   await expect(page.locator(".connection")).toHaveCount(3);
+  await expectViewportMap(page);
   await page.screenshot({
     path: "test-results/public-desktop.png",
     fullPage: true,
   });
   expect(errors).toEqual([]);
+});
+
+async function expectViewportMap(page: Page) {
+  const dimensions = await page.evaluate(() => ({
+    viewport: { width: innerWidth, height: innerHeight },
+    document: {
+      width: document.documentElement.scrollWidth,
+      height: document.documentElement.scrollHeight,
+    },
+    map: document.querySelector(".world-map")!.getBoundingClientRect().toJSON(),
+    nav: document.querySelector(".topbar")!.getBoundingClientRect().toJSON(),
+  }));
+  expect(dimensions.document.width).toBeLessThanOrEqual(
+    dimensions.viewport.width,
+  );
+  expect(dimensions.document.height).toBeLessThanOrEqual(
+    dimensions.viewport.height,
+  );
+  expect(dimensions.map.width).toBeCloseTo(dimensions.viewport.width, 0);
+  expect(dimensions.map.top).toBeCloseTo(dimensions.nav.bottom, 0);
+  expect(dimensions.map.bottom).toBeCloseTo(dimensions.viewport.height, 0);
+}
+
+async function mapTransform(page: Page) {
+  return page.locator(".map-geography").evaluate((element) => {
+    const matrix = (element as SVGGraphicsElement).getScreenCTM()!;
+    return { a: matrix.a, e: matrix.e, f: matrix.f };
+  });
+}
+
+for (const admin of [false, true]) {
+  test(`map gestures, pointer anchoring and drag work in ${admin ? "admin" : "public"} view`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await setup(page, admin);
+    await page.goto(admin ? "/admin/" : "/");
+    await expect(page.locator(".connection")).toHaveCount(3);
+    const map = page.locator(".world-map");
+    const bounds = (await map.boundingBox())!;
+    const anchor = {
+      x: Math.round(bounds.x + bounds.width * 0.35),
+      y: Math.round(bounds.y + bounds.height * 0.4),
+    };
+    const before = await mapTransform(page);
+    const canceled = await map.evaluate(
+      (element, anchor) =>
+        !element.dispatchEvent(
+          new WheelEvent("wheel", {
+            clientX: anchor.x,
+            clientY: anchor.y,
+            deltaY: -40,
+            ctrlKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        ),
+      anchor,
+    );
+    expect(canceled).toBe(true);
+    await expect
+      .poll(async () => (await mapTransform(page)).a)
+      .toBeGreaterThan(before.a);
+    const after = await mapTransform(page);
+    const ratio = after.a / before.a;
+    expect(after.e + (anchor.x - before.e) * ratio).toBeCloseTo(anchor.x, 3);
+    expect(after.f + (anchor.y - before.f) * ratio).toBeCloseTo(anchor.y, 3);
+    for (const delta of [-10000, 10000]) {
+      for (let i = 0; i < 15; i++)
+        await map.evaluate(
+          (element, deltaY) =>
+            element.dispatchEvent(
+              new WheelEvent("wheel", {
+                deltaY,
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+              }),
+            ),
+          delta,
+        );
+      await expect
+        .poll(async () => (await mapTransform(page)).a)
+        .toBeCloseTo(delta < 0 ? 5 : 1, 4);
+    }
+    await page.getByRole("button", { name: "重置地图" }).click();
+    const reset = await mapTransform(page);
+    await page.mouse.move(bounds.x + 50, bounds.y + bounds.height - 90);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + 110, bounds.y + bounds.height - 60, {
+      steps: 5,
+    });
+    await page.mouse.up();
+    const dragged = await mapTransform(page);
+    expect(dragged.e - reset.e).toBeCloseTo(60, 1);
+    expect(dragged.f - reset.f).toBeCloseTo(30, 1);
+    await expect(
+      page.getByRole("dialog", { name: "地图节点信息" }),
+    ).toHaveCount(0);
+    await page.getByRole("button", { name: "重置地图" }).click();
+    expect(await mapTransform(page)).toEqual(reset);
+    await page.getByRole("button", { name: "放大地图" }).click();
+    await expect
+      .poll(async () => (await mapTransform(page)).a)
+      .toBeCloseTo(1.4, 4);
+    await page.getByRole("button", { name: "缩小地图" }).click();
+    await expect
+      .poll(async () => (await mapTransform(page)).a)
+      .toBeCloseTo(1, 4);
+  });
+}
+
+test("overlapping nodes and sources share a popup and keyboard activation", async ({
+  page,
+}) => {
+  const data = structuredClone(fixture);
+  data.nodes[1].latitude = data.nodes[0].latitude;
+  data.nodes[1].longitude = data.nodes[0].longitude;
+  data.bans[0].latitude = data.nodes[0].latitude;
+  data.bans[0].longitude = data.nodes[0].longitude;
+  data.bans.push({ ...data.bans[0], jail: "other", observed_at: now - 300 });
+  await setup(page, false, data);
+  await page.goto("/");
+  const marker = page.getByRole("button", { name: /^受保护节点 192\.0/ });
+  await marker.focus();
+  await page.keyboard.press("Enter");
+  const popup = page.getByRole("dialog", { name: "地图节点信息" });
+  await expect(popup.locator(".map-popup-item")).toHaveCount(3);
+  await expect(popup).toContainText("198.51.x.x");
+  await expect(popup).toContainText("203.0.113.x");
+  await page.keyboard.press("Escape");
+  await expect(popup).toHaveCount(0);
+  await marker.focus();
+  await page.keyboard.press("Space");
+  await expect(popup).toBeVisible();
+  await page.locator(".world-map").click({ position: { x: 30, y: 60 } });
+  await expect(popup).toHaveCount(0);
+});
+
+test("selected popup follows map movement, refreshes, and closes when its node disappears", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const data = structuredClone(fixture);
+  await setup(page, false, data);
+  await page.goto("/");
+  const marker = page.getByRole("button", { name: /^受保护节点 192\.0/ });
+  await marker.click();
+  const popup = page.getByRole("dialog", { name: "地图节点信息" });
+  const before = (await popup.boundingBox())!;
+  const map = page.locator(".world-map");
+  const bounds = (await map.boundingBox())!;
+  await page.mouse.move(bounds.x + 30, bounds.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x, bounds.y + 120, { steps: 3 });
+  await page.mouse.up();
+  await expect(popup).toBeVisible();
+  await expect
+    .poll(async () => (await popup.boundingBox())!.x)
+    .toBeCloseTo(before.x - 30, 0);
+  data.nodes[0].online = false;
+  await page.clock.fastForward(10000);
+  await expect(popup).toContainText("离线 · 最后已知状态");
+  data.nodes.splice(0, 1);
+  data.bans = data.bans.filter((ban) => ban.node_id !== "a");
+  await page.clock.fastForward(10000);
+  await expect(popup).toHaveCount(0);
+});
+
+for (const [name, addresses, expected] of [
+  ["IPv4", { ip: "192.0.2.9", ipv4: "192.0.2.9", ipv6: null }, ["192.0.2.9"]],
+  [
+    "IPv6",
+    { ip: "2001:db8::9", ipv4: null, ipv6: "2001:db8::9" },
+    ["2001:db8::9"],
+  ],
+  [
+    "dual stack",
+    { ip: "192.0.2.9", ipv4: "192.0.2.9", ipv6: "2001:db8::9" },
+    ["192.0.2.9", "2001:db8::9"],
+  ],
+  ["unknown", { ip: null, ipv4: null, ipv6: null }, ["未知 IP"]],
+  [
+    "legacy IPv4",
+    { ip: "192.0.2.9", ipv4: undefined, ipv6: undefined },
+    ["192.0.2.9"],
+  ],
+  [
+    "legacy IPv6",
+    { ip: "2001:db8::9", ipv4: undefined, ipv6: undefined },
+    ["2001:db8::9"],
+  ],
+] as const) {
+  test(`address display only shows available addresses: ${name}`, async ({
+    page,
+  }) => {
+    const data = structuredClone(fixture);
+    Object.assign(data.nodes[0], addresses);
+    await setup(page, true, data);
+    await page.goto("/admin/");
+    await page.getByRole("button", { name: /^受保护节点 Singapore/ }).click();
+    const popup = page.getByRole("dialog", { name: "地图节点信息" });
+    await expect(popup.locator(".node-addresses code")).toHaveText([
+      ...expected,
+    ]);
+    await expect(popup).not.toContainText(/IPv4|IPv6|未探测到/);
+    await page.getByRole("button", { name: "节点管理", exact: true }).click();
+    await expect(
+      page.locator(".node-card").first().locator(".node-addresses code"),
+    ).toHaveText([...expected]);
+  });
+}
+
+test("mobile popup stays in bounds after resize and marker dragging does not open it", async ({
+  page,
+}) => {
+  await setup(page);
+  await page.goto("/");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectViewportMap(page);
+  const marker = page.getByRole("button", { name: /^受保护节点 192\.0/ });
+  const markerBox = (await marker.boundingBox())!;
+  await page.mouse.move(
+    markerBox.x + markerBox.width / 2,
+    markerBox.y + markerBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    markerBox.x + markerBox.width / 2 + 15,
+    markerBox.y + markerBox.height / 2 + 10,
+    { steps: 3 },
+  );
+  await page.mouse.up();
+  const popup = page.getByRole("dialog", { name: "地图节点信息" });
+  await expect(popup).toHaveCount(0);
+  await marker.click();
+  await expect(popup).toBeVisible();
+  const box = (await popup.boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
+  expect(box.y + box.height).toBeLessThanOrEqual(844);
+});
+
+test("unknown geography and network failure display map notices and allow retry", async ({
+  page,
+}) => {
+  const data = structuredClone(fixture);
+  data.bans.forEach((ban) => {
+    ban.latitude = null;
+    ban.longitude = null;
+  });
+  let fail = true;
+  await page.route("**/api/public/dashboard", (route) =>
+    route.fulfill(
+      fail
+        ? { status: 503, json: { error: "暂时无法连接控制端" } }
+        : { json: publicFixture(data) },
+    ),
+  );
+  await page.goto("/");
+  await expect(page.getByRole("alert")).toContainText("暂时无法连接控制端");
+  await expectViewportMap(page);
+  fail = false;
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByText("等待具有地理坐标的封禁记录")).toBeVisible();
+  await expect(page.locator(".map-marker")).toHaveCount(2);
+  await expect(page.getByText(/下方列表/)).toHaveCount(0);
 });
