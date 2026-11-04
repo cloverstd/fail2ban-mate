@@ -17,7 +17,11 @@ test("reads Wrangler JSONC including comments and trailing commas", () => {
   assert.equal(config.d1_databases[0].database_id, variables.D1_DATABASE_ID);
   assert.equal(config.vars.ACCESS_AUD, "test-aud");
   assert.equal(config.durable_objects.bindings.length, 2);
-  assert.equal(config.routes, undefined);
+  assert.deepEqual(config.routes, [
+    { pattern: "fail2ban.cloverstd.com", custom_domain: true },
+  ]);
+  assert.equal(config.workers_dev, false);
+  assert.equal(config.preview_urls, false);
 });
 test("rejects missing deployment identity and invalid hostname", () => {
   assert.throws(

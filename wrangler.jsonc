@@ -3,6 +3,9 @@
   "name": "fail2ban-mate",
   "main": "worker/index.ts",
   "compatibility_date": "2026-11-03",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "fail2ban.cloverstd.com", "custom_domain": true }],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

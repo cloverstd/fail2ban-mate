@@ -16,8 +16,9 @@
 
 ## 当前部署
 
-- 公开看板：[fail2ban-mate.cloverstd.workers.dev](https://fail2ban-mate.cloverstd.workers.dev)
-- 管理后台：[进入后台](https://fail2ban-mate.cloverstd.workers.dev/admin)，通过 Cloudflare Access 的 GitHub 身份提供商登录，仅允许 `cloverstd@gmail.com`。
+- 公开看板：[fail2ban.cloverstd.com](https://fail2ban.cloverstd.com)
+- 管理后台：[进入后台](https://fail2ban.cloverstd.com/admin)，通过 Cloudflare Access 的 GitHub 身份提供商登录，仅允许 `cloverstd@gmail.com`。
+- 默认 `workers.dev` 域名和预览地址均已关闭，配置保存在 `wrangler.jsonc`，后续部署继续生效。
 - 服务端 CI：Cloudflare Workers Builds 连接本仓库 `main`，负责检查、构建、D1 迁移和部署；非生产分支构建已关闭。
 - Access 使用现有团队 `cloverstd.cloudflareaccess.com`，仅保护后台页面和管理 API，公开页面与 agent 接口保持公开路由。
 - 客户端版本与二进制：[GitHub Releases](https://github.com/cloverstd/fail2ban-mate/releases)。
@@ -62,12 +63,14 @@ pnpm exec wrangler d1 create fail2ban-mate
 2. 在 GitHub Settings → Developer settings → OAuth Apps 创建 OAuth App。
 3. Homepage URL 填团队域名；Authorization callback URL 填 `https://your-team.cloudflareaccess.com/cdn-cgi/access/callback`。
 4. 在 Cloudflare Zero Trust → Integrations → Identity providers 添加 GitHub，将 GitHub Client ID / Secret 配置到 Cloudflare。OAuth secret 不进入 Worker、GitHub 仓库或网页。
-5. 为 Worker 域名创建一个 **Self-hosted Access Application**。可先确定默认域名 `fail2ban-mate.<你的子域>.workers.dev`，也可使用自定义域名。
+5. 为 Worker 的自定义域名创建一个 **Self-hosted Access Application**。本项目使用 `fail2ban.cloverstd.com`；部署到其他域名时，同时更新 Access 的受保护路径和构建变量 `WORKER_DOMAIN`。
 6. 在同一个 Application 添加以下路径，确保它们共用一个 AUD：`/admin`、`/admin/*`、`/api/admin/*`。按控制台路径规则覆盖 `/admin` 及其子路径，并验证 API 路径同样受保护。
 7. Allow 策略仅允许管理员邮箱，并限定 GitHub 身份提供商。Worker 的 `ADMIN_EMAILS` 必须包含相同的邮箱，用英文逗号分隔。
 8. 保存 Application Audience (AUD)。公开首页、`/api/public/*`、`/api/agent/v1/*`、`/install.sh` 不应进入 Access 登录保护，否则客户端会收到登录 HTML。
 
 Worker 本身也会校验 JWT，因此通过备用域名绕过 Access 边缘策略时，后台仍拒绝无效身份。缺失认证配置会直接拒绝访问；项目不提供生产认证绕过开关。
+
+当前 GitHub OAuth 回调为 `https://cloverstd.cloudflareaccess.com/cdn-cgi/access/callback`。它使用 Access 团队域名，更换 Worker 域名时无需更改 GitHub OAuth App 的回调；更新现有 Access Application 的域名并保留 AUD 即可。
 
 参考：[Access GitHub 身份提供商](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/github/)、[Access JWT 校验](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)。
 
@@ -90,14 +93,14 @@ Build command 生成部署配置，运行 TypeScript / Vite 构建、Workers 集
 
 在 **Cloudflare Builds 构建变量** 中配置：
 
-| 名称                 | 值                                               |
-| -------------------- | ------------------------------------------------ |
-| `NODE_VERSION`       | `22`                                             |
-| `ACCESS_TEAM_DOMAIN` | `https://your-team.cloudflareaccess.com`         |
-| `ACCESS_AUD`         | Access Application 的 AUD                        |
-| `ADMIN_EMAILS`       | 已默认设为 `cloverstd@gmail.com`，可选覆盖       |
-| `D1_DATABASE_ID`     | 已默认设为本项目生产 D1 ID，其他账号部署时覆盖   |
-| `WORKER_DOMAIN`      | 可选，例如 `ban.example.com`，不要包含协议或路径 |
+| 名称                 | 值                                                        |
+| -------------------- | --------------------------------------------------------- |
+| `NODE_VERSION`       | `22`                                                      |
+| `ACCESS_TEAM_DOMAIN` | `https://your-team.cloudflareaccess.com`                  |
+| `ACCESS_AUD`         | Access Application 的 AUD                                 |
+| `ADMIN_EMAILS`       | 已默认设为 `cloverstd@gmail.com`，可选覆盖                |
+| `D1_DATABASE_ID`     | 已默认设为本项目生产 D1 ID，其他账号部署时覆盖            |
+| `WORKER_DOMAIN`      | 默认 `fail2ban.cloverstd.com`，可选覆盖，不包含协议或路径 |
 
 `packageManager` 将 pnpm 固定为 `9.15.9`。Access 的团队域名、AUD 和邮箱属于非敏感运行配置，部署脚本会写入 Worker vars；GitHub OAuth secret 只保存在 Cloudflare Access 身份提供商中。
 
