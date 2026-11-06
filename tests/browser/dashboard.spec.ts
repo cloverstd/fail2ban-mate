@@ -6,6 +6,7 @@ const now = Math.floor(Date.now() / 1000);
 const fixture: Data = {
   generated_at: now,
   actor: "admin@example.com",
+  visitor_ip: "198.51.100.42",
   policy_revision: 1,
   nodes: [
     {
@@ -123,6 +124,10 @@ function publicFixture(data: Data): PublicData {
       ...ban,
       ip: maskIP(ban.ip),
     })),
+    ban_history: data.ban_history?.map(({ jail: _jail, ...ban }) => ({
+      ...ban,
+      ip: maskIP(ban.ip),
+    })),
   };
 }
 async function setup(
@@ -130,7 +135,10 @@ async function setup(
   admin = false,
   data: Data = structuredClone(fixture),
 ) {
-  await page.routeWebSocket("**/api/admin/ws", () => {});
+  let notify = () => {};
+  await page.routeWebSocket("**/api/admin/ws", (socket) => {
+    notify = () => socket.send("refresh");
+  });
   await page.route("**/api/**", async (route) => {
     const req = route.request(),
       u = new URL(req.url());
@@ -151,6 +159,7 @@ async function setup(
       json: { ok: true, ids: ["test-command"] },
     });
   });
+  return () => notify();
 }
 test("public page contains only navigation and the map with private fields removed", async ({
   page,
@@ -304,6 +313,250 @@ test("ban, release, and permanent global whitelist submit correct targets", asyn
     duration: null,
   });
 });
+test("whitelist defaults to the visitor IP and submits it unchanged", async ({
+  page,
+}) => {
+  await setup(page, true);
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "全局白名单", exact: true }).click();
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  await expect(page.getByLabel("IP 来源", { exact: true })).toHaveValue(
+    "visitor",
+  );
+  await expect(page.getByLabel("IP 地址", { exact: true })).toHaveValue(
+    fixture.visitor_ip!,
+  );
+  const request = page.waitForRequest(
+    (r) => r.url().endsWith("/api/admin/whitelist") && r.method() === "POST",
+  );
+  await page.getByRole("button", { name: "应用全局规则" }).click();
+  expect((await request).postDataJSON()).toEqual({
+    ip: fixture.visitor_ip,
+    duration: 3600,
+  });
+});
+
+test("whitelist selects node IPv4 or IPv6 and allows editing or restoring the visitor IP", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setup(page, true);
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "全局白名单", exact: true }).click();
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  const source = page.getByLabel("IP 来源", { exact: true });
+  const address = page.getByLabel("IP 地址", { exact: true });
+  await source.selectOption({ label: "Singapore · edge-01 · 192.0.2.9" });
+  await expect(address).toHaveValue("192.0.2.9");
+  await source.selectOption({ label: "Singapore · edge-01 · 2001:db8:1::9" });
+  await expect(address).toHaveValue("2001:db8:1::9");
+  await source.selectOption({ label: "Frankfurt · edge-02 · 198.51.100.8" });
+  await expect(address).toHaveValue("198.51.100.8");
+  await address.fill("2001:db8::123");
+  await expect(source).toHaveValue("manual");
+  await source.selectOption("visitor");
+  await expect(address).toHaveValue(fixture.visitor_ip!);
+  await source.selectOption("manual");
+  await expect(address).toHaveValue(fixture.visitor_ip!);
+  await address.fill("2001:db8::123");
+  const request = page.waitForRequest(
+    (r) => r.url().endsWith("/api/admin/whitelist") && r.method() === "POST",
+  );
+  await page.getByRole("button", { name: "应用全局规则" }).click();
+  expect((await request).postDataJSON()).toEqual({
+    ip: "2001:db8::123",
+    duration: 3600,
+  });
+});
+
+test("whitelist receives a late visitor IP but preserves manually edited and cleared values on refresh", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const data = structuredClone(fixture);
+  data.visitor_ip = null;
+  data.nodes[0].ipv4 = undefined;
+  data.nodes[0].ipv6 = undefined;
+  data.nodes[1].ip = null;
+  data.nodes[1].ipv4 = null;
+  const notify = await setup(page, true, data);
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "全局白名单", exact: true }).click();
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  const source = page.getByLabel("IP 来源", { exact: true });
+  const address = page.getByLabel("IP 地址", { exact: true });
+  await expect(address).toHaveValue("");
+  await expect(
+    page.getByText("未获取到访问者 IP，请选择节点地址或手动输入。"),
+  ).toBeVisible();
+  await expect(source.locator("optgroup option")).toHaveCount(1);
+  data.visitor_ip = "2001:db8::42";
+  notify();
+  await page.clock.runFor(1000);
+  await expect(address).toHaveValue("2001:db8::42");
+  await address.fill("8.8.8.8");
+  data.visitor_ip = "198.51.100.45";
+  notify();
+  await page.clock.runFor(1000);
+  await expect(address).toHaveValue("8.8.8.8");
+  await address.clear();
+  data.visitor_ip = "198.51.100.46";
+  notify();
+  await page.clock.runFor(1000);
+  await expect(address).toHaveValue("");
+  await source.selectOption({ label: "Singapore · edge-01 · 192.0.2.9" });
+  await expect(address).toHaveValue("192.0.2.9");
+});
+
+test("ban list includes released history, filters by status and only selects active bans", async ({
+  page,
+}) => {
+  const data = structuredClone(fixture);
+  data.ban_history = [
+    {
+      ...data.bans[0],
+      id: "history",
+      jail: "retired-service",
+      observed_at: now - 300,
+      unbanned_at: now - 60,
+    },
+  ];
+  await setup(page, true, data);
+  await page.goto("/admin/");
+  const activeStat = page.locator(".stat").filter({ hasText: "当前封禁" });
+  await expect(activeStat.locator("strong")).toHaveText("3");
+  await page.getByRole("button", { name: "封禁列表", exact: true }).click();
+  await expect(page.locator("tbody tr")).toHaveCount(4);
+  const history = page
+    .locator("tbody tr")
+    .filter({ hasText: "retired-service" });
+  await expect(history).toContainText("已解禁");
+  await expect(history.getByRole("checkbox")).toBeDisabled();
+  await expect(
+    history.getByRole("button", { name: "解封", exact: true }),
+  ).toBeDisabled();
+  await page.getByLabel("选择本页封禁").check();
+  await expect(page.locator(".selection-bar")).toContainText("已选择 3 条");
+  const submitted = page.waitForRequest(
+    (r) => r.url().endsWith("/api/admin/commands") && r.method() === "POST",
+  );
+  await page.getByRole("button", { name: "批量解除封禁", exact: true }).click();
+  expect((await submitted).postDataJSON()).toHaveLength(3);
+  await page.getByLabel("筛选封禁状态").selectOption("unbanned");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByLabel("选择本页封禁")).toBeDisabled();
+  await page.getByLabel("筛选 service").selectOption("retired-service");
+  await expect(history).toBeVisible();
+  await page.getByLabel("筛选 service").selectOption("");
+  await page.getByLabel("筛选封禁状态").selectOption("banned");
+  await expect(page.locator("tbody tr")).toHaveCount(3);
+});
+
+test("a selected ban stays in the list as released history after a live refresh", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const data = structuredClone(fixture);
+  const notify = await setup(page, true, data);
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "封禁列表", exact: true }).click();
+  await page.getByLabel("选择 203.0.113.77", { exact: true }).check();
+  const released = data.bans.shift()!;
+  data.ban_history = [{ ...released, id: "released", unbanned_at: now }];
+  notify();
+  await page.clock.runFor(1000);
+  const row = page.locator("tbody tr").filter({ hasText: "203.0.113.77" });
+  await expect(row).toContainText("已解禁");
+  await expect(row.getByRole("checkbox")).toBeDisabled();
+  await expect(page.locator(".selection-bar")).toHaveCount(0);
+  await expect(page.locator("tbody tr")).toHaveCount(3);
+});
+
+for (const admin of [false, true]) {
+  test(`map shows red active bans and yellow released history with age fading in ${admin ? "admin" : "public"} view`, async ({
+    page,
+  }) => {
+    await page.clock.install({ time: now * 1000 });
+    const data = structuredClone(fixture);
+    data.bans[1].observed_at = now - 86400;
+    data.ban_history = [
+      {
+        ...data.bans[0],
+        id: "recent-release",
+        observed_at: now - 100000,
+        unbanned_at: now - 60,
+      },
+      {
+        ...data.bans[2],
+        id: "old-release",
+        observed_at: now - 10 * 86400,
+        unbanned_at: now - 7 * 86400,
+      },
+    ];
+    await setup(page, admin, data);
+    await page.goto(admin ? "/admin/" : "/");
+    await expect(page.locator(".connection")).toHaveCount(5);
+    await expect(page.locator(".source-active")).toHaveCount(3);
+    await expect(page.locator(".source-released")).toHaveCount(2);
+    const recentRed = page
+      .locator(".map-connection[data-status='banned']")
+      .first();
+    const oldRed = page.locator(".map-connection[data-status='banned']").nth(1);
+    const recentYellow = page
+      .locator(".map-connection[data-status='unbanned']")
+      .first();
+    const oldYellow = page
+      .locator(".map-connection[data-status='unbanned']")
+      .nth(1);
+    await expect(recentRed).toHaveCSS("color", "rgb(239, 68, 68)");
+    await expect(recentYellow).toHaveCSS("color", "rgb(250, 204, 21)");
+    const opacity = (locator: typeof recentRed) =>
+      locator.evaluate((e) => Number(getComputedStyle(e).opacity));
+    expect(await opacity(recentRed)).toBeGreaterThan(await opacity(oldRed));
+    expect(await opacity(recentYellow)).toBeGreaterThan(
+      await opacity(oldYellow),
+    );
+    expect(await opacity(oldYellow)).toBeGreaterThan(0);
+    // A shared location preserves both its active center and released ring.
+    const marker = page
+      .getByRole("button", { name: /^封禁来源/ })
+      .filter({ has: page.locator(".source-active") })
+      .filter({ has: page.locator(".source-released") })
+      .first();
+    await marker.click();
+    const popup = page.getByRole("dialog", { name: "地图节点信息" });
+    await expect(popup).toContainText("封禁中");
+    await expect(popup).toContainText("已解禁");
+    await expect(popup).toContainText("解禁时间");
+    if (!admin)
+      await expect(popup).not.toContainText(/203\.0\.113\.77|sshd|edge-01/);
+    const before = await opacity(recentRed);
+    await page.clock.fastForward(60000);
+    expect(await opacity(recentRed)).toBeLessThan(before);
+    if (!admin)
+      await page.screenshot({
+        path: "test-results/ban-history-map.png",
+        fullPage: true,
+      });
+  });
+}
+
+test("map includes sources beyond the previous 200-location limit", async ({
+  page,
+}) => {
+  const data = structuredClone(fixture);
+  data.bans = Array.from({ length: 201 }, (_, index) => ({
+    ...fixture.bans[0],
+    ip: `203.0.${Math.floor(index / 256)}.${index % 256}`,
+    latitude: 20,
+    longitude: -100 + index * 0.5,
+  }));
+  await setup(page, true, data);
+  await page.goto("/admin/");
+  await expect(page.locator(".connection")).toHaveCount(201);
+  await expect(page.locator(".source-active")).toHaveCount(201);
+});
+
 test("mobile layout and empty/unknown geography states remain usable", async ({
   page,
 }) => {
@@ -604,4 +857,174 @@ test("unknown geography and network failure display map notices and allow retry"
   await expect(page.getByText("等待具有地理坐标的封禁记录")).toBeVisible();
   await expect(page.locator(".map-marker")).toHaveCount(2);
   await expect(page.getByText(/下方列表/)).toHaveCount(0);
+});
+
+test("manages integration Tokens once and deletes dynamic rules from the whitelist", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const data = structuredClone(fixture);
+  await setup(page, true, data);
+  const id = "a5d63f36-d409-4c7e-8253-6d8d67ab27d5";
+  const token = "f2bm_" + "a".repeat(64);
+  const rotated = "f2bm_" + "b".repeat(64);
+  await page.route("**/api/admin/integrations**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/rotate")) {
+      data.integrations![0].token_prefix = rotated.slice(0, 13);
+      return route.fulfill({ json: { id, token: rotated } });
+    }
+    if (path.endsWith("/revoke")) {
+      data.integrations![0].revoked_at = now;
+      return route.fulfill({ json: { ok: true } });
+    }
+    const { name } = route.request().postDataJSON() as { name: string };
+    data.integrations = [
+      {
+        id,
+        name,
+        token_prefix: token.slice(0, 13),
+        last_used_at: null,
+        revoked_at: null,
+      },
+    ];
+    return route.fulfill({ status: 201, json: { id, token } });
+  });
+  await page.route("**/api/admin/dynamic-whitelist/*", async (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    data.policies = [];
+    await route.fulfill({ json: { ok: true } });
+  });
+
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "接口接入" }).click();
+  await page.getByLabel("调用方名称").fill("Home CDSG");
+  await page.getByRole("button", { name: "创建 Token" }).click();
+  const secret = page.getByRole("group", { name: "新接入 Token" });
+  await expect(secret).toContainText(token);
+  await page.getByRole("button", { name: "复制 Token" }).click();
+  await expect(secret).toHaveCount(0);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(token);
+  await expect(page.getByRole("row", { name: /Home CDSG/ })).toContainText(
+    token.slice(0, 13) + "…",
+  );
+  await expect(page.locator("body")).not.toContainText(token);
+  await page.reload();
+  await page.getByRole("button", { name: "接口接入" }).click();
+  await expect(page.getByRole("row", { name: /Home CDSG/ })).toBeVisible();
+  await expect(secret).toHaveCount(0);
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "轮换 Token" }).click();
+  await expect(secret).toContainText(rotated);
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("button", { name: "撤销 Token" }).click();
+  await expect(page.getByRole("row", { name: /Home CDSG/ })).toContainText(
+    "已撤销",
+  );
+
+  data.policies = [
+    {
+      id: "rule",
+      ip: "198.51.100.51",
+      expires_at: now + 86400,
+      actor: "Home CDSG",
+      created_at: now,
+      source: "integration",
+      owner_id: "home",
+      synced_at: now,
+    },
+  ];
+  await page.reload();
+  await page.getByRole("button", { name: "全局白名单" }).click();
+  const rule = page.getByRole("row", { name: /198\.51\.100\.51/ });
+  await expect(rule).toContainText("接口 · Home CDSG / home");
+  await rule.getByRole("button", { name: "撤销" }).click();
+  await expect(rule).toHaveCount(0);
+});
+
+test("firewall rule groups can be edited and reordered before publishing a node", async ({
+  page,
+}) => {
+  await setup(page, true);
+  const node = fixture.nodes[0];
+  let groups: Record<string, unknown>[] = [];
+  let published = false;
+  const defaults = { in: "deny", out: "allow", route: "deny" };
+  await page.route("**/api/admin/firewall/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith("/groups")) {
+      if (request.method() === "POST")
+        groups = [{ ...request.postDataJSON(), id: "group-1", revision: 1 }];
+      return route.fulfill({
+        json: request.method() === "POST" ? groups[0] : groups,
+      });
+    }
+    if (path.endsWith("/preview"))
+      return route.fulfill({
+        json: {
+          version: "test-preview",
+          node_id: node.id,
+          before: [],
+          before_defaults: defaults,
+          after: { defaults, rules: groups[0].rules },
+          affected: [{ id: node.id, name: node.name }],
+        },
+      });
+    if (path.endsWith("/publish")) {
+      expect(request.postDataJSON()).toEqual([
+        { node_id: node.id, version: "test-preview" },
+      ]);
+      published = true;
+      return route.fulfill({
+        json: { outcomes: [{ node_id: node.id, id: "test-release" }] },
+      });
+    }
+    return route.fulfill({
+      json: {
+        observation: {
+          status: "active",
+          defaults,
+          rules: [],
+          observed_at: now,
+          protection: [],
+          ipv6: true,
+        },
+        draft: groups.length
+          ? {
+              revision: 1,
+              defaults,
+              bindings: [{ group_id: "group-1", priority: 10 }],
+              protection: [],
+            }
+          : null,
+        history: [],
+      },
+    });
+  });
+  await page.goto("/admin/");
+  await page.getByRole("button", { name: "防火墙", exact: true }).click();
+  await page.getByRole("button", { name: "创建规则组" }).click();
+  await page.getByLabel("规则组名称").fill("SSH 策略");
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  await page.getByRole("button", { name: "添加规则", exact: true }).click();
+  await page.getByLabel("动作", { exact: true }).nth(1).selectOption("deny");
+  await page.getByRole("button", { name: "上移", exact: true }).nth(1).click();
+  await page.getByRole("button", { name: "保存规则组草稿" }).click();
+  await expect(page.getByText("已保存规则组草稿")).toBeVisible();
+  expect(groups[0].rules).toMatchObject([
+    { action: "deny", priority: 10 },
+    { action: "allow", priority: 20 },
+  ]);
+  expect(published).toBe(false);
+  await page.getByRole("button", { name: "节点规则", exact: true }).click();
+  await expect(page.getByText("草稿合并顺序（基础规则之后）")).toBeVisible();
+  await page.getByRole("button", { name: "预览发布", exact: true }).click();
+  await expect(page.getByText("发布后的顺序")).toBeVisible();
+  await page.getByRole("button", { name: "发布到所选节点" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "已提交发布" }),
+  ).toBeVisible();
+  expect(published).toBe(true);
 });

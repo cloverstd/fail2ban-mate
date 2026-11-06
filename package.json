@@ -8,7 +8,7 @@
     "dev": "vite",
     "dev:worker": "wrangler dev",
     "build": "tsc --noEmit && vite build && vite build --mode admin",
-    "build:cloudflare": "node scripts/configure-deploy.mjs && pnpm build && pnpm test && node --test tests/deploy-config.test.mjs tests/public-build.test.mjs",
+    "build:cloudflare": "node scripts/configure-deploy.mjs && pnpm build && pnpm test && node --test tests/deploy-config.test.mjs tests/public-build.test.mjs tests/ban-history-migration.test.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "deploy": "pnpm build && wrangler deploy",

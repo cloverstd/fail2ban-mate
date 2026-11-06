@@ -33,9 +33,11 @@ export type PublicNode = Pick<
   | "observed_at"
 >;
 export interface PublicBanRow extends Geo {
+  id?: string;
   node_id: string;
   ip: string;
   observed_at: number;
+  unbanned_at?: number | null;
 }
 export interface BanRow extends PublicBanRow {
   jail: string;
@@ -43,7 +45,15 @@ export interface BanRow extends PublicBanRow {
 export interface PublicData {
   nodes: PublicNode[];
   bans: PublicBanRow[];
+  ban_history?: PublicBanRow[];
   generated_at: number;
+}
+export interface IntegrationRow {
+  id: string;
+  name: string;
+  token_prefix: string;
+  last_used_at: number | null;
+  revoked_at: number | null;
 }
 export interface PolicyRow {
   id: string;
@@ -51,6 +61,9 @@ export interface PolicyRow {
   expires_at: number | null;
   created_at: number;
   actor: string;
+  source?: "manual" | "integration";
+  owner_id?: string | null;
+  synced_at?: number | null;
 }
 export interface CommandRow {
   id: string;
@@ -73,10 +86,13 @@ export interface AuditRow {
 export interface Data {
   nodes: Node[];
   bans: BanRow[];
+  ban_history?: BanRow[];
   generated_at: number;
   actor?: string;
+  visitor_ip?: string | null;
   policy_revision?: number;
   policies?: PolicyRow[];
+  integrations?: IntegrationRow[];
   commands?: CommandRow[];
   audit?: AuditRow[];
 }

@@ -7,6 +7,7 @@ import type { FeatureCollection } from "geojson";
 import { Minus, Plus, RotateCcw, X } from "lucide-react";
 import type { Node, PublicBanRow, PublicNode } from "./types";
 import { NodeAddresses, nodeAddressLabel } from "./NodeAddresses";
+import { banAppearance } from "./banAppearance";
 
 const countries = feature(
   world as unknown as Topology,
@@ -50,6 +51,11 @@ export function WorldMap({
   const [view, setView] = useState<View>(initialView);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [popupSize, setPopupSize] = useState({ width: 300, height: 240 });
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 60000);
+    return () => clearInterval(timer);
+  }, []);
   const drag = useRef<{
     id: number;
     x: number;
@@ -110,35 +116,54 @@ export function WorldMap({
       return marker;
     };
     nodes.forEach((node) => group(node)?.nodes.push(node));
-    const seen = new Set<string>();
-    const sourceLocations = new Set<string>();
     const sourceRows = new Map<string, PublicBanRow>();
-    const connections: { key: string; d: string }[] = [];
+    const connections = new Map<
+      string,
+      { key: string; d: string; ban: PublicBanRow }
+    >();
     bans.forEach((ban) => {
       const from = point(ban);
       if (!from) return;
       const location = `${ban.longitude},${ban.latitude}`;
-      if (!sourceLocations.has(location) && sourceLocations.size >= 200) return;
-      sourceLocations.add(location);
       // Different services can describe the same visible source and target.
-      const rowKey = `${location}|${ban.ip}|${ban.node_id}`;
+      const state = ban.unbanned_at == null ? "banned" : "unbanned";
+      const rowKey = `${location}|${ban.ip}|${ban.node_id}|${state}`;
       const previous = sourceRows.get(rowKey);
-      if (!previous || previous.observed_at < ban.observed_at)
+      if (
+        !previous ||
+        (previous.unbanned_at ?? previous.observed_at) <
+          (ban.unbanned_at ?? ban.observed_at)
+      )
         sourceRows.set(rowKey, ban);
       const node = nodeById.get(ban.node_id);
       const to = node ? point(node) : null;
-      const key = `${location}|${ban.node_id}`;
-      if (!to || seen.has(key) || seen.size >= 200) return;
-      seen.add(key);
+      const key = `${location}|${ban.node_id}|${state}`;
+      if (!to) return;
+      const previousConnection = connections.get(key);
+      if (
+        previousConnection &&
+        (previousConnection.ban.unbanned_at ??
+          previousConnection.ban.observed_at) >=
+          (ban.unbanned_at ?? ban.observed_at)
+      )
+        return;
       const [x, y] = from,
         [tx, ty] = to;
-      connections.push({
+      connections.set(key, {
         key,
+        ban,
         d: `M${x},${y} Q${(x + tx) / 2},${Math.min(y, ty) - Math.min(100, Math.abs(x - tx) * 0.18) - 18} ${tx},${ty}`,
       });
     });
     sourceRows.forEach((ban) => group(ban)?.sources.push(ban));
-    return { connections, markers: [...groups.values()] };
+    // Draw active connections last when both states share the same route.
+    return {
+      connections: [...connections.values()].sort(
+        (a, b) =>
+          Number(a.ban.unbanned_at == null) - Number(b.ban.unbanned_at == null),
+      ),
+      markers: [...groups.values()],
+    };
   }, [nodes, bans, nodeById, projection]);
   const selected = markers.find((marker) => marker.key === selectedKey);
   useEffect(() => {
@@ -334,26 +359,52 @@ export function WorldMap({
           {countries.features.map((country, i) => (
             <path key={i} d={path(country) ?? ""} className="country" />
           ))}
-          {connections.map(({ key, d }, i) => (
-            <g key={key} className="map-connection">
-              <path d={d} className="connection" />
-              <circle r="2" fill="#f5a65b">
-                <animateMotion
-                  dur={`${3 + (i % 4)}s`}
-                  repeatCount="indefinite"
-                  path={d}
-                />
-              </circle>
-            </g>
-          ))}
+          {connections.map(({ key, d, ban }, i) => {
+            const appearance = banAppearance(ban, now);
+            return (
+              <g
+                key={key}
+                className="map-connection"
+                data-status={appearance.status}
+                style={{
+                  color: appearance.color,
+                  opacity: appearance.opacity,
+                }}
+              >
+                <path d={d} className="connection" />
+                {ban.unbanned_at == null && (
+                  <circle r="2" fill="currentColor">
+                    <animateMotion
+                      dur={`${3 + (i % 4)}s`}
+                      repeatCount="indefinite"
+                      path={d}
+                    />
+                  </circle>
+                )}
+              </g>
+            );
+          })}
           {markers.map((marker) => {
             const isNode = marker.nodes.length > 0;
+            const active = marker.sources.filter((b) => b.unbanned_at == null);
+            const released = marker.sources.filter(
+              (b) => b.unbanned_at != null,
+            );
+            const sourceStyle = (rows: PublicBanRow[]) => ({
+              color: banAppearance(rows[0], now).color,
+              opacity: Math.max(
+                ...rows.map((b) => banAppearance(b, now).opacity),
+              ),
+            });
             const label = [
               ...marker.nodes.map(
                 (node) =>
                   `受保护节点 ${!publicView && node.name ? node.name : nodeAddressLabel(node)}`,
               ),
-              ...marker.sources.map((ban) => `封禁来源 ${ban.ip}`),
+              ...marker.sources.map(
+                (ban) =>
+                  `封禁来源 ${ban.ip} · ${ban.unbanned_at == null ? "封禁中" : "已解禁"}`,
+              ),
             ].join("；");
             return (
               <g
@@ -377,17 +428,33 @@ export function WorldMap({
               >
                 <circle r="14" className="marker-hit" />
                 {isNode && <circle r="11" className="node-halo" />}
-                <circle
-                  r={isNode ? 4 : 3}
-                  className={isNode ? "node-dot" : "source-dot"}
-                  fill={
-                    isNode
-                      ? marker.nodes.some((node) => node.online)
+                {released.length > 0 && (
+                  <circle
+                    r={isNode ? 10 : active.length ? 7 : 3.5}
+                    className="source-dot source-released"
+                    fill={isNode || active.length ? "none" : "currentColor"}
+                    style={sourceStyle(released)}
+                  />
+                )}
+                {active.length > 0 && (
+                  <circle
+                    r={isNode ? 7 : 3.5}
+                    className="source-dot source-active"
+                    fill={isNode ? "none" : "currentColor"}
+                    style={sourceStyle(active)}
+                  />
+                )}
+                {isNode && (
+                  <circle
+                    r="4"
+                    className="node-dot"
+                    fill={
+                      marker.nodes.some((node) => node.online)
                         ? "#72e8be"
                         : "#82919f"
-                      : undefined
-                  }
-                />
+                    }
+                  />
+                )}
               </g>
             );
           })}
@@ -429,15 +496,25 @@ export function WorldMap({
               return (
                 <div
                   className="map-popup-item"
-                  key={`${ban.ip}|${ban.node_id}`}
+                  key={`${ban.ip}|${ban.node_id}|${ban.unbanned_at == null ? "banned" : "unbanned"}`}
                 >
                   <strong>封禁来源</strong>
                   <code>{ban.ip}</code>
                   <span>{place(ban)}</span>
+                  <span
+                    className={
+                      ban.unbanned_at == null ? "ban-active" : "ban-released"
+                    }
+                  >
+                    {ban.unbanned_at == null ? "封禁中" : "已解禁"}
+                  </span>
                   <small>目标节点</small>
                   {!publicView && node?.name && <span>{node.name}</span>}
                   <NodeAddresses node={node} />
                   <small>观测时间：{time(ban.observed_at)}</small>
+                  {ban.unbanned_at != null && (
+                    <small>解禁时间：{time(ban.unbanned_at)}</small>
+                  )}
                 </div>
               );
             })}
@@ -469,10 +546,11 @@ export function WorldMap({
         )
       )}
       <div className="map-bottom">
-        <span>
-          <i className="legend-source" />
-          封禁来源 <i className="legend-node" />
-          受保护节点
+        <span title="红色按封禁时间在 24 小时内渐淡；黄色按解禁时间在 7 天内渐淡，历史记录保留最低可见度">
+          <i className="legend-source legend-active" />
+          封禁中 <i className="legend-source legend-released" />
+          已解禁 <i className="legend-node" />
+          节点
         </span>
         {publicView && (
           <a

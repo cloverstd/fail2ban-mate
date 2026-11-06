@@ -43,13 +43,15 @@ esac
 '''
 
 class InstallerTests(unittest.TestCase):
-    def run_install(self, distro="apt-get", arch="x86_64", existing=False, tamper=False, fail_enroll=False, epel=False, action=None):
+    def run_install(self, distro="apt-get", arch="x86_64", existing=False, tamper=False, fail_enroll=False, epel=False, action=None,ufw=False):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);mock=root/'mock';mock.mkdir();downloads=root/'downloads';downloads.mkdir()
             for path in ['run/systemd/system','etc/systemd/system','etc/fail2ban-mate','var/lib/fail2ban-mate','usr/local/bin','etc/fail2ban/jail.d']:(root/path).mkdir(parents=True,exist_ok=True)
             original=root/'etc/fail2ban/jail.d/original.local';original.write_text('[sshd]\nenabled=true\n')
             for name in ['id','uname','systemctl','curl',distro]:
                 p=mock/name;p.write_text(MOCK);p.chmod(0o755)
+            if ufw:
+                p=mock/'ufw';p.write_text('#!/bin/sh\nexit 0\n');p.chmod(0o755)
             if existing:
                 p=mock/'fail2ban-client';p.write_text('#!/bin/sh\nexit 0\n');p.chmod(0o755)
             target_arch='arm64' if arch=='aarch64' else 'amd64';archive=f'fail2ban-mate-client_linux_{target_arch}.tar.gz'
@@ -80,6 +82,9 @@ class InstallerTests(unittest.TestCase):
             if action=='upgrade':self.assertEqual(config.read_text(),'{"preserved":true}')
             else:self.assertEqual(config.stat().st_mode&0o777,0o600)
             self.assertIn('systemctl enable --now fail2ban-mate.service fail2ban-mate-geo.timer',calls)
+            if ufw:
+                self.assertIn('systemctl enable --now fail2ban-mate-firewall.timer', calls)
+                self.assertIn('RequiredBy=ufw.service', (root/'etc/systemd/system/fail2ban-mate-firewall-boot.service').read_text())
             if existing:self.assertNotIn(distro+' install',calls)
             elif not action:
                 self.assertIn(distro+' install',calls)
@@ -88,6 +93,7 @@ class InstallerTests(unittest.TestCase):
     def test_debian_installs_missing_fail2ban(self):self.run_install()
     def test_ubuntu_preserves_existing_fail2ban(self):self.run_install(existing=True)
     def test_rocky_enables_epel_and_installs(self):self.run_install(distro='dnf',epel=True)
+    def test_ufw_rollback_units(self):self.run_install(existing=True,ufw=True)
     def test_yum_install(self):self.run_install(distro='yum')
     def test_arm64_archive(self):self.run_install(arch='aarch64')
     def test_integrity_failure_does_not_replace_binary(self):self.run_install(tamper=True)

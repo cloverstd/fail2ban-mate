@@ -285,3 +285,44 @@ func TestParsingAndIgnoreCIDR(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestReplacingDynamicPolicyKeepsOtherSourcesAndExpiresOffline(t *testing.T) {
+	ctx := context.Background()
+	f := fake()
+	path := statePath(t)
+	s := NewState()
+	expiry := int64(200)
+	s.Policies = []Policy{
+		{ID: "manual", IP: "8.8.8.8"},
+		{ID: "other", IP: "1.1.1.1", ExpiresAt: &expiry},
+		{ID: "dynamic", IP: "8.8.8.8", ExpiresAt: &expiry},
+		{ID: "moving", IP: "9.9.9.9", ExpiresAt: &expiry},
+	}
+	if err := ApplyPolicies(ctx, f, s, path, 100); err != nil {
+		t.Fatal(err)
+	}
+	s.Policies[2].IP = "1.1.1.1"
+	s.Policies[3].IP = "8.8.4.4"
+	if err := ApplyPolicies(ctx, f, s, path, 110); err != nil {
+		t.Fatal(err)
+	}
+	for _, jail := range f.jails {
+		ignored := strings.Join(f.ignores[jail], " ")
+		if Ignored(ignored, "9.9.9.9") || !Ignored(ignored, "8.8.4.4") ||
+			!Ignored(ignored, "8.8.8.8") || !Ignored(ignored, "1.1.1.1") {
+			t.Fatalf("wrong policy after replacement: %v", f.ignores)
+		}
+	}
+	restarted, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPolicies(ctx, f, restarted, path, 200); err != nil {
+		t.Fatal(err)
+	}
+	for _, jail := range f.jails {
+		if !reflect.DeepEqual(f.ignores[jail], []string{"8.8.8.8"}) {
+			t.Fatalf("wrong policy after offline expiry: %v", f.ignores)
+		}
+	}
+}

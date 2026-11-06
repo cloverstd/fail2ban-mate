@@ -35,3 +35,12 @@ export interface NodeRow {
   longitude: number | null;
   created_at: number;
 }
+
+export type AppEnv = {
+  Bindings: Env;
+  Variables: {
+    actor: string;
+    authExp: number;
+    integration: { id: string; name: string; digest: string };
+  };
+};

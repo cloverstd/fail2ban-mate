@@ -19,7 +19,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test
-      - run: node --test tests/deploy-config.test.mjs tests/public-build.test.mjs
+      - run: node --test tests/deploy-config.test.mjs tests/public-build.test.mjs tests/ban-history-migration.test.mjs
       - run: pnpm exec wrangler deploy --dry-run --outdir /tmp/worker-bundle
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm exec playwright test

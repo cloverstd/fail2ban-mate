@@ -34,7 +34,7 @@
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",
     "ADMIN_EMAILS": "cloverstd@gmail.com",
-    "RETENTION_DAYS": "30",
+    "RETENTION_DAYS": "365",
   },
   "observability": { "enabled": true, "logs": { "invocation_logs": false } },
 }

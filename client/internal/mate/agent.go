@@ -27,16 +27,18 @@ type netEvent struct {
 	http bool
 }
 type Agent struct {
-	Config        Config
-	State         *State
-	Runner        Runner
-	Version       string
-	Geo           *GeoDB
-	geoModified   time.Time
-	snapshot      *Snapshot
-	forceSnapshot bool
-	scanError     string
-	policyError   string
+	firewall        *firewallManager
+	firewallRefresh int64
+	Config          Config
+	State           *State
+	Runner          Runner
+	Version         string
+	Geo             *GeoDB
+	geoModified     time.Time
+	snapshot        *Snapshot
+	forceSnapshot   bool
+	scanError       string
+	policyError     string
 }
 
 func (a *Agent) persist() error { return WriteJSON(a.Config.StatePath, a.State) }
@@ -71,6 +73,16 @@ func (a *Agent) scan(ctx context.Context) error {
 func (a *Agent) payload(actual, reason string, full bool) (Sync, error) {
 	s := a.State
 	p := Sync{Protocol: 1, Type: "sync", Version: a.Version, ActualMode: actual, FallbackReason: reason, ConfigRevision: s.Remote.Revision, PolicyRevision: s.AppliedPolicyRevision, Events: []Event{}, Results: []Result{}}
+	if a.firewall != nil {
+		p.Firewall = a.firewall.Observation
+		if p.Firewall != nil {
+			if encoded, _ := json.Marshal(p.Firewall); len(encoded) > 900000 || len(p.Firewall.Rules) > 4000 {
+				p.Firewall = &FirewallObservation{Status: "unavailable", ObservedAt: p.Firewall.ObservedAt,
+					Rules: []FirewallRule{}, Protection: []SSHProtection{}, Blocked: []string{"UFW snapshot exceeds supported size"}}
+			}
+		}
+		p.FirewallReceipt = a.firewall.Receipt
+	}
 	p.Error = strings.Join(nonempty(a.scanError, a.policyError), "; ")
 	if len(p.Error) > 1000 {
 		p.Error = p.Error[:1000]
@@ -167,6 +179,15 @@ func (a *Agent) accept(ctx context.Context, m ServerSync) error {
 			delete(s.CompletedAt, id)
 		}
 	}
+	if a.firewall != nil {
+		if m.FirewallRefresh > a.firewallRefresh {
+			a.firewallRefresh = m.FirewallRefresh
+			a.firewall.Next = time.Time{}
+		}
+		if m.Firewall != nil {
+			a.firewall.apply(ctx, *m.Firewall, a.firewallClaim, a.firewallConfirm)
+		}
+	}
 	if m.SnapshotRequired {
 		a.forceSnapshot = true
 	}
@@ -222,6 +243,7 @@ func (a *Agent) dial(ctx context.Context) (*websocket.Conn, error) {
 }
 func (a *Agent) Run(ctx context.Context) error {
 	defer func() { a.Geo.Close() }()
+	a.firewall = &firewallManager{Config: a.Config}
 	if err := a.scan(ctx); err != nil {
 		return err
 	}
@@ -346,12 +368,15 @@ func (a *Agent) Run(ctx context.Context) error {
 						transport.NextDial = time.Now()
 					}
 				}
-				if len(e.msg.Commands) > 0 || oldPolicy != a.State.AppliedPolicyRevision || oldConfig != a.State.Remote.Revision {
+				if e.msg.Firewall != nil || len(e.msg.Commands) > 0 || oldPolicy != a.State.AppliedPolicyRevision || oldConfig != a.State.Remote.Revision {
 					dirty = true
 					nextScan = time.Now()
 				}
 			}
 		case t := <-tick.C:
+			if a.firewall.scan(ctx, a.firewallConfirm) {
+				dirty = true
+			}
 			if !t.Before(nextScan) {
 				before := a.State.Sequence
 				beforePolicy := a.State.AppliedPolicyRevision
@@ -402,4 +427,36 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (a *Agent) firewallProbe(ctx context.Context, operation, id string, drift bool) error {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	defer transport.CloseIdleConnections()
+	client := http.Client{Transport: transport, Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	path := a.Config.Server + "/api/agent/v1/firewall/" + operation + "?id=" + url.QueryEscape(id)
+	if drift {
+		path += "&drift=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Config.Token)
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("control server firewall verification connection failed")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("control server firewall %s returned %d", operation, res.StatusCode)
+	}
+	return nil
+}
+
+func (a *Agent) firewallClaim(ctx context.Context, id string) error {
+	return a.firewallProbe(ctx, "claim", id, false)
+}
+func (a *Agent) firewallConfirm(ctx context.Context, id string, drift bool) error {
+	return a.firewallProbe(ctx, "confirm", id, drift)
 }

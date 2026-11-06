@@ -1,7 +1,8 @@
+import { firewallAdmin, firewallAgent } from "./firewall";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
-import type { Env, NodeRow } from "./env";
+import type { AppEnv, Env, NodeRow } from "./env";
 import { admin, agent, hash, secret, sameOrigin } from "./auth";
 import {
   createNodeSchema,
@@ -12,9 +13,14 @@ import {
 import { maskIP } from "./privacy";
 import { connectingAddress, nodeAddresses, splitAddress } from "./addresses";
 import { notifyDashboard, wakeNode, wakeAll } from "./sync";
+import {
+  dynamicWhitelistAdmin,
+  integrationAdmin,
+  integrationAPI,
+  listIntegrations,
+} from "./integrations";
 export { NodeConnection, Dashboard } from "./connections";
 
-type AppEnv = { Bindings: Env; Variables: { actor: string; authExp: number } };
 const app = new Hono<AppEnv>();
 const now = () => Math.floor(Date.now() / 1000);
 async function audit(env: Env, actor: string, action: string, detail: unknown) {
@@ -90,11 +96,17 @@ app.use("/api/admin/*", async (c, next) => {
   c.set("authExp", a.exp);
   await next();
 });
+app.route("/api/integrations/v1", integrationAPI);
+app.route("/api/admin/integrations", integrationAdmin);
+app.route("/api/admin/firewall", firewallAdmin);
+app.route("/api/agent/v1/firewall", firewallAgent);
+app.route("/api/admin/dynamic-whitelist", dynamicWhitelistAdmin);
+
 app.get("/api/public/dashboard", async (c) => {
   const cache = (caches as unknown as { default: Cache }).default;
   const cacheURL = new URL(c.req.url);
   // Version the public projection so older snapshots cannot expose service names.
-  cacheURL.searchParams.set("__public_schema", "2");
+  cacheURL.searchParams.set("__public_schema", "3");
   const key = new Request(cacheURL);
   const hit = await cache.match(key);
   if (hit) {
@@ -102,7 +114,7 @@ app.get("/api/public/dashboard", async (c) => {
     response.headers.set("Cache-Control", "no-store");
     return response;
   }
-  const [nodes, bans] = await Promise.all([
+  const [nodes, bans, history] = await Promise.all([
     c.env.DB.prepare(
       "SELECT id,ip,ipv4,ipv6,country,city,latitude,longitude,last_seen,observed_at,poll_interval,(token_hash IS NOT NULL) AS authenticated FROM nodes WHERE enabled=1",
     ).all<
@@ -131,6 +143,19 @@ app.get("/api/public/dashboard", async (c) => {
       latitude: number | null;
       longitude: number | null;
       observed_at: number;
+    }>(),
+    c.env.DB.prepare(
+      "SELECT h.id,h.node_id,h.ip,h.country,h.city,h.latitude,h.longitude,h.observed_at,h.unbanned_at FROM ban_history h JOIN nodes n ON h.node_id=n.id WHERE n.enabled=1 ORDER BY h.observed_at DESC LIMIT 20000",
+    ).all<{
+      id: string;
+      node_id: string;
+      ip: string;
+      country: string | null;
+      city: string | null;
+      latitude: number | null;
+      longitude: number | null;
+      observed_at: number;
+      unbanned_at: number;
     }>(),
   ]);
   const response = Response.json(
@@ -165,6 +190,7 @@ app.get("/api/public/dashboard", async (c) => {
         longitude: b.longitude,
         observed_at: b.observed_at,
       })),
+      ban_history: history.results.map((b) => ({ ...b, ip: maskIP(b.ip) })),
     },
     {
       headers: {
@@ -185,13 +211,25 @@ app.get("/api/admin/dashboard", async (c) => {
   )
     .bind(now(), now())
     .run();
-  const [nodes, bans, policies, commands, logs, settings] = await Promise.all([
+  const [
+    nodes,
+    bans,
+    history,
+    policies,
+    commands,
+    logs,
+    settings,
+    integrations,
+  ] = await Promise.all([
     c.env.DB.prepare("SELECT * FROM nodes ORDER BY created_at").all<NodeRow>(),
     c.env.DB.prepare(
       "SELECT * FROM bans ORDER BY observed_at DESC LIMIT 20000",
     ).all(),
     c.env.DB.prepare(
-      "SELECT * FROM whitelist WHERE expires_at IS NULL OR expires_at>? ORDER BY created_at DESC",
+      "SELECT * FROM ban_history ORDER BY observed_at DESC LIMIT 20000",
+    ).all(),
+    c.env.DB.prepare(
+      "SELECT * FROM whitelist_rules WHERE expires_at IS NULL OR expires_at>? ORDER BY created_at DESC",
     )
       .bind(now())
       .all(),
@@ -204,12 +242,16 @@ app.get("/api/admin/dashboard", async (c) => {
     c.env.DB.prepare("SELECT policy_revision FROM settings WHERE id=1").first<{
       policy_revision: number;
     }>(),
+    listIntegrations(c.env),
   ]);
   return c.json({
     actor: c.get("actor"),
+    visitor_ip: connectingAddress(c.req.raw),
     nodes: nodes.results.map(nodeView),
     bans: bans.results,
+    ban_history: history.results,
     policies: policies.results,
+    integrations,
     commands: commands.results,
     audit: logs.results,
     policy_revision: settings!.policy_revision,
@@ -320,7 +362,7 @@ app.post("/api/admin/commands", async (c) => {
     if (
       p.kind === "ban" &&
       (await c.env.DB.prepare(
-        "SELECT id FROM whitelist WHERE ip=? AND (expires_at IS NULL OR expires_at>?)",
+        "SELECT id FROM whitelist_rules WHERE ip=? AND (expires_at IS NULL OR expires_at>?)",
       )
         .bind(p.ip, now())
         .first())
@@ -458,9 +500,10 @@ app.get("*", (c) => {
   return c.env.ASSETS.fetch(c.req.raw);
 });
 export async function cleanup(env: Env): Promise<void> {
-  const days = Math.min(3650, Math.max(1, Number(env.RETENTION_DAYS) || 30));
+  const days = Math.min(3650, Math.max(1, Number(env.RETENTION_DAYS) || 365));
   const cutoff = now() - days * 86400;
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM ban_history WHERE unbanned_at<?").bind(cutoff),
     env.DB.prepare("DELETE FROM events WHERE received_at<?").bind(cutoff),
     env.DB.prepare("DELETE FROM audit WHERE created_at<?").bind(cutoff),
     env.DB.prepare(
@@ -469,6 +512,9 @@ export async function cleanup(env: Env): Promise<void> {
     env.DB.prepare(
       "UPDATE commands SET status='expired',completed_at=? WHERE status IN ('pending','running') AND expires_at<=?",
     ).bind(now(), now()),
+    env.DB.prepare("DELETE FROM dynamic_whitelist WHERE expires_at<=?").bind(
+      now(),
+    ),
     env.DB.prepare(
       "DELETE FROM whitelist WHERE expires_at IS NOT NULL AND expires_at<=?",
     ).bind(now()),

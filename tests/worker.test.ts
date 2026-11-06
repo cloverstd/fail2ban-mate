@@ -14,7 +14,8 @@ import {
   vi,
 } from "vitest";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
-import worker from "../worker";
+import worker, { cleanup } from "../worker";
+import type { Data, PublicData } from "../web/types";
 import { hash, secret } from "../worker/auth";
 import { maskIP } from "../worker/privacy";
 import { canonicalIP, syncSchema } from "../worker/validation";
@@ -117,14 +118,66 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   await env.DB.batch(
-    ["commands", "events", "bans", "nodes", "whitelist", "audit"].map((t) =>
-      env.DB.prepare(`DELETE FROM ${t}`),
-    ),
+    [
+      "commands",
+      "events",
+      "ban_history",
+      "bans",
+      "nodes",
+      "whitelist",
+      "dynamic_whitelist",
+      "integrations",
+      "audit",
+    ].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
   );
   await env.DB.prepare("UPDATE settings SET policy_revision=1").run();
 });
 afterAll(() => vi.unstubAllGlobals());
 describe("access and enrollment", () => {
+  it("returns the current visitor address only in the authenticated uncached dashboard", async () => {
+    const cases = [
+      { headers: { ip: "198.51.100.42" }, expected: "198.51.100.42" },
+      { headers: { ip: "2001:0db8::42" }, expected: "2001:db8::42" },
+      { headers: { ip: "::ffff:198.51.100.42" }, expected: "198.51.100.42" },
+      {
+        headers: { ip: "240.1.2.3", ipv6: "2001:db8::42" },
+        expected: "2001:db8::42",
+      },
+      { headers: { ip: "invalid" }, expected: null },
+      { headers: {}, expected: null },
+    ];
+    for (const { headers, expected } of cases) {
+      const response = await request(
+        "/api/admin/dashboard",
+        "GET",
+        undefined,
+        undefined,
+        { admin: true, ...headers },
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect((await response.json<Data>()).visitor_ip).toBe(expected);
+    }
+    const denied = await request(
+      "/api/admin/dashboard",
+      "GET",
+      undefined,
+      undefined,
+      { ip: "198.51.100.42" },
+    );
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).not.toHaveProperty("visitor_ip");
+    const publicResponse = await request(
+      "/api/public/dashboard?visitor=" + crypto.randomUUID(),
+      "GET",
+      undefined,
+      undefined,
+      { ip: "198.51.100.42" },
+    );
+    const publicData = await publicResponse.json();
+    expect(publicData).not.toHaveProperty("visitor_ip");
+    expect(JSON.stringify(publicData)).not.toContain("198.51.100.42");
+  });
   it("serves the separate administration page and assets only after authentication", async () => {
     const assets = {
       fetch: vi.fn(
@@ -266,6 +319,222 @@ describe("access and enrollment", () => {
     expect(
       (await request("/api/agent/v1/sync", "POST", sync(), a.token)).status,
     ).toBe(401);
+  });
+});
+describe("ban history", () => {
+  async function dashboard() {
+    const res = await request(
+      "/api/admin/dashboard",
+      "GET",
+      undefined,
+      undefined,
+      { admin: true },
+    );
+    expect(res.status).toBe(200);
+    return res.json<Data>();
+  }
+  const change = (seq: number, kind: "ban" | "unban", observed_at: number) => ({
+    id: crypto.randomUUID(),
+    seq,
+    kind,
+    observed_at,
+    jail: "sshd",
+    ip: "203.0.113.77",
+    country: "United States",
+    latitude: 40.7,
+    longitude: -74,
+  });
+
+  it("retains separate periods after unban, reban and stale retries, including changes in the same second", async () => {
+    const a = await create();
+    const first = [change(1, "ban", 100), change(2, "unban", 100)];
+    const send = (events: ReturnType<typeof change>[]) =>
+      request(
+        "/api/agent/v1/sync",
+        "POST",
+        sync({
+          sequence: events.at(-1)!.seq,
+          events,
+          snapshot: undefined,
+        }),
+        a.token,
+      );
+    expect((await send(first)).status).toBe(200);
+    const next = [change(3, "ban", 100), change(4, "unban", 200)];
+    expect((await send(next)).status).toBe(200);
+    expect((await send(first)).status).toBe(200);
+    const data = await dashboard();
+    expect(data.bans).toEqual([]);
+    expect(data.ban_history).toHaveLength(2);
+    expect(data.ban_history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          observed_at: 100,
+          unbanned_at: 100,
+          ip: first[0].ip,
+        }),
+        expect.objectContaining({
+          observed_at: 100,
+          unbanned_at: 200,
+          ip: first[0].ip,
+        }),
+      ]),
+    );
+    const publicRes = await request(
+      "/api/public/dashboard?history=" + crypto.randomUUID(),
+    );
+    const publicData = await publicRes.json<PublicData>();
+    expect(publicData.ban_history).toHaveLength(2);
+    expect(publicData.ban_history![0]).toMatchObject({
+      ip: "203.0.113.x",
+      latitude: 40.7,
+    });
+    expect(JSON.stringify(publicData)).not.toMatch(
+      /sshd|203\.0\.113\.77|edge-test/,
+    );
+    await request(
+      `/api/admin/nodes/${a.node_id}`,
+      "PATCH",
+      { enabled: false },
+      undefined,
+      { admin: true },
+    );
+    const hidden = await request(
+      "/api/public/dashboard?history=" + crypto.randomUUID(),
+    );
+    expect((await hidden.json<PublicData>()).ban_history).toEqual([]);
+  });
+
+  it("archives snapshot removals but leaves unchanged and unavailable jails active", async () => {
+    const a = await create();
+    const ban = { jail: "sshd", ip: "203.0.113.77", observed_at: 100 };
+    const initial = sync({
+      snapshot: {
+        seq: 1,
+        jails: [{ name: "sshd", bans: [ban] }],
+        unavailable_jails: [],
+      },
+    });
+    expect(
+      (await request("/api/agent/v1/sync", "POST", initial, a.token)).status,
+    ).toBe(200);
+    await request("/api/agent/v1/sync", "POST", initial, a.token);
+    expect((await dashboard()).ban_history).toEqual([]);
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({
+        sequence: 2,
+        snapshot: { seq: 2, jails: [], unavailable_jails: ["sshd"] },
+      }),
+      a.token,
+    );
+    expect((await dashboard()).bans).toHaveLength(1);
+    expect((await dashboard()).ban_history).toEqual([]);
+    const removed = sync({
+      sequence: 3,
+      snapshot: { seq: 3, jails: [], unavailable_jails: [] },
+    });
+    await request("/api/agent/v1/sync", "POST", removed, a.token);
+    await request("/api/agent/v1/sync", "POST", removed, a.token);
+    const data = await dashboard();
+    expect(data.bans).toEqual([]);
+    expect(data.ban_history).toHaveLength(1);
+    expect(data.ban_history![0]).toMatchObject(ban);
+    expect(data.ban_history![0].unbanned_at).toBeGreaterThan(100);
+  });
+
+  it("recovers periods from an event backlog overtaken by a full snapshot", async () => {
+    const a = await create();
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({
+        sequence: 100,
+        snapshot: { seq: 100, jails: [], unavailable_jails: [] },
+      }),
+      a.token,
+    );
+    const events = [change(1, "ban", 100), change(2, "unban", 200)];
+    expect(
+      (
+        await request(
+          "/api/agent/v1/sync",
+          "POST",
+          sync({ sequence: 2, events, snapshot: undefined }),
+          a.token,
+        )
+      ).status,
+    ).toBe(200);
+    const data = await dashboard();
+    expect(data.bans).toEqual([]);
+    expect(data.ban_history).toMatchObject([
+      { observed_at: 100, unbanned_at: 200 },
+    ]);
+  });
+
+  it("replaces snapshot fallback times with a late observed unban without duplicating history", async () => {
+    const a = await create();
+    const ban = change(1, "ban", 100);
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({
+        snapshot: {
+          seq: 1,
+          jails: [{ name: "sshd", bans: [ban] }],
+          unavailable_jails: [],
+        },
+      }),
+      a.token,
+    );
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({
+        sequence: 100,
+        snapshot: { seq: 100, jails: [], unavailable_jails: [] },
+      }),
+      a.token,
+    );
+    expect((await dashboard()).ban_history).toHaveLength(1);
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({
+        sequence: 2,
+        events: [ban, change(2, "unban", 200)],
+        snapshot: undefined,
+      }),
+      a.token,
+    );
+    expect((await dashboard()).ban_history).toMatchObject([
+      { observed_at: 100, unbanned_at: 200 },
+    ]);
+  });
+
+  it("expires released history by release time and preserves current bans", async () => {
+    const a = await create();
+    const now = Math.floor(Date.now() / 1000);
+    const events = [
+      change(1, "ban", 1),
+      change(2, "unban", now - 366 * 86400),
+      change(3, "ban", 2),
+      change(4, "unban", now - 1),
+      change(5, "ban", 3),
+    ];
+    await request(
+      "/api/agent/v1/sync",
+      "POST",
+      sync({ sequence: 5, events, snapshot: undefined }),
+      a.token,
+    );
+    await cleanup({ ...env, RETENTION_DAYS: "365" });
+    const data = await dashboard();
+    expect(data.bans).toHaveLength(1);
+    expect(data.ban_history).toMatchObject([
+      { observed_at: 2, unbanned_at: now - 1 },
+    ]);
   });
 });
 describe("sync and commands", () => {
@@ -552,7 +821,7 @@ describe("public privacy", () => {
     const path = "/api/public/dashboard?cache-test=" + crypto.randomUUID();
     const legacyKey = new Request(origin + path);
     const cacheURL = new URL(origin + path);
-    cacheURL.searchParams.set("__public_schema", "2");
+    cacheURL.searchParams.set("__public_schema", "3");
     const key = new Request(cacheURL);
     const cache = (caches as unknown as { default: Cache }).default;
     try {
@@ -755,5 +1024,469 @@ describe("public privacy", () => {
       expect(text).not.toContain(value);
     expect(text).toContain("203.0.113.x");
     expect(text).toContain("192.0.x.x");
+  });
+});
+
+describe("dynamic whitelist integrations", () => {
+  const manage = "/api/admin/integrations";
+  const rule = "/api/integrations/v1/whitelist/home";
+  const adminOptions = { admin: true };
+  const a = "198.51.100.13";
+  const b = "198.51.100.14";
+  const status = (method: string, bearer?: string, ip = a) =>
+    request(rule, method, method === "PUT" ? { ip } : undefined, bearer);
+  async function issue(name = "CDSG") {
+    const res = await request(
+      manage,
+      "POST",
+      { name },
+      undefined,
+      adminOptions,
+    );
+    expect(res.status).toBe(201);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    return res.json<{ id: string; token: string }>();
+  }
+
+  it("requires scoped credentials, keeps metadata private, and validates addresses", async () => {
+    const c = await issue();
+    const node = await create();
+    expect(c.token).toMatch(/^f2bm_[0-9a-f]{64}$/);
+    for (const bearer of [undefined, "invalid", node.token]) {
+      expect((await status("PUT", bearer)).status).toBe(401);
+    }
+    expect((await request(manage, "GET", undefined, c.token)).status).toBe(403);
+    expect(
+      (await request("/api/agent/v1/addresses", "GET", undefined, c.token))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await request(manage, "POST", { name: "x" }, undefined, {
+          ...adminOptions,
+          origin: "https://untrusted.example",
+        })
+      ).status,
+    ).toBe(403);
+    expect((await status("PUT", c.token, a + "/32")).status).toBe(400);
+    expect((await status("PUT", c.token, "2001:0db8::1")).status).toBe(200);
+    expect(
+      (await (await status("GET", c.token)).json<{ ip: string }>()).ip,
+    ).toBe("2001:db8::1");
+    const list = await (
+      await request(manage, "GET", undefined, undefined, adminOptions)
+    ).text();
+    expect(list).toContain(c.token.slice(0, 13));
+    expect(list).not.toContain(c.token);
+    expect(list).not.toContain(await hash(c.token));
+    const publicData = await (
+      await request("/api/public/dashboard?integration-test=1")
+    ).json();
+    expect(publicData).not.toHaveProperty("integrations");
+    expect(publicData).not.toHaveProperty("policies");
+  });
+
+  it("renews and replaces a single rule while keeping other sources and syncing nodes", async () => {
+    const c = await issue();
+    const other = await issue("Other");
+    const node = await create();
+    const clock = vi.spyOn(Date, "now");
+    const at = Math.floor(Date.now() / 1000);
+    clock.mockReturnValue(at * 1000);
+    try {
+      const put = async (bearer: string, ip: string) => {
+        const res = await status("PUT", bearer, ip);
+        expect(res.status).toBe(200);
+        return res.json<{
+          id: string;
+          key: string;
+          ip: string;
+          expires_at: number;
+          policy_revision: number;
+        }>();
+      };
+      const first = await put(c.token, a);
+      expect(first).toMatchObject({
+        ip: a,
+        key: "home",
+        expires_at: at + 86400,
+        policy_revision: 2,
+      });
+      expect((await status("GET", other.token)).status).toBe(404);
+      clock.mockReturnValue((at + 60) * 1000);
+      const renewal = await put(c.token, a);
+      expect(renewal).toMatchObject({
+        id: first.id,
+        expires_at: at + 60 + 86400,
+        policy_revision: 3,
+      });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) AS n FROM audit WHERE action='dynamic_whitelist.upsert'",
+        ).first("n"),
+      ).toBe(1);
+
+      await put(other.token, a);
+      await request(
+        "/api/admin/whitelist",
+        "POST",
+        { ip: a, duration: null },
+        undefined,
+        adminOptions,
+      );
+      const replaced = await put(c.token, b);
+      expect(replaced).toMatchObject({ id: first.id, ip: b });
+
+      const state = await (
+        await request("/api/agent/v1/sync", "POST", sync(), node.token)
+      ).json<ServerSync>();
+      expect(state.policies.map((p) => p.ip).sort()).toEqual([a, a, b]);
+      expect(state.policy_revision).toBe(replaced.policy_revision);
+      const ban = await request(
+        "/api/admin/commands",
+        "POST",
+        [{ node_id: node.node_id, jail: "sshd", kind: "ban", ip: b }],
+        undefined,
+        adminOptions,
+      );
+      expect(ban.status).toBe(409);
+
+      expect((await status("DELETE", other.token)).status).toBe(200);
+      expect((await status("DELETE", other.token)).status).toBe(200);
+      expect((await status("GET", c.token)).status).toBe(200);
+      clock.mockReturnValue(replaced.expires_at * 1000);
+      expect((await status("GET", c.token)).status).toBe(404);
+      await cleanup(env);
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) AS n FROM dynamic_whitelist",
+        ).first("n"),
+      ).toBe(0);
+      const after = await (
+        await request("/api/agent/v1/sync", "POST", sync(), node.token)
+      ).json<ServerSync>();
+      expect(after.policies.map((p) => p.ip)).toEqual([a]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("rotates credentials without removing rules and rejects a PUT racing with revocation", async () => {
+    const c = await issue();
+    const first = await (await status("PUT", c.token)).json<{ id: string }>();
+    const rotated = await request(
+      `${manage}/${c.id}/rotate`,
+      "POST",
+      undefined,
+      undefined,
+      adminOptions,
+    );
+    expect(rotated.status).toBe(200);
+    const { token } = await rotated.json<{ token: string }>();
+    expect((await status("PUT", c.token)).status).toBe(401);
+    expect((await (await status("GET", token)).json<{ id: string }>()).id).toBe(
+      first.id,
+    );
+    const ctx = createExecutionContext();
+    const req = new Request(origin + rule, {
+      method: "PUT",
+      headers: { Authorization: "Bearer " + token },
+    });
+    // Revoke after request authentication and before its write batch.
+    const readBody = vi.spyOn(req, "text").mockImplementation(async () => {
+      expect(
+        (
+          await request(
+            `${manage}/${c.id}/revoke`,
+            "POST",
+            undefined,
+            undefined,
+            adminOptions,
+          )
+        ).status,
+      ).toBe(200);
+      return JSON.stringify({ ip: b });
+    });
+    expect((await worker.fetch(req, env, ctx)).status).toBe(401);
+    await waitOnExecutionContext(ctx);
+    expect(readBody).toHaveBeenCalledOnce();
+    expect((await status("GET", token)).status).toBe(401);
+    expect(
+      await env.DB.prepare("SELECT count(*) AS n FROM dynamic_whitelist").first(
+        "n",
+      ),
+    ).toBe(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) AS n FROM audit WHERE action='dynamic_whitelist.upsert'",
+      ).first("n"),
+    ).toBe(1);
+    expect(
+      await env.DB.prepare("SELECT policy_revision FROM settings").first(
+        "policy_revision",
+      ),
+    ).toBe(3);
+  });
+
+  it("rolls back the rule and audit if the revision cannot be written", async () => {
+    const c = await issue();
+    await env.DB.prepare(
+      "CREATE TRIGGER fail_revision BEFORE UPDATE ON settings BEGIN SELECT RAISE(ABORT,'test failure'); END",
+    ).run();
+    try {
+      expect((await status("PUT", c.token)).status).toBe(500);
+      expect((await status("GET", c.token)).status).toBe(404);
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) AS n FROM audit WHERE action='dynamic_whitelist.upsert'",
+        ).first("n"),
+      ).toBe(0);
+      expect(
+        await env.DB.prepare("SELECT last_used_at FROM integrations").first(
+          "last_used_at",
+        ),
+      ).toBeNull();
+    } finally {
+      await env.DB.prepare("DROP TRIGGER fail_revision").run();
+    }
+  });
+});
+
+describe("UFW rule group publishing", () => {
+  const root = "/api/admin/firewall";
+  const admin = { admin: true };
+  const rule = (priority: number, action: "allow" | "deny" = "allow") => ({
+    id: crypto.randomUUID(),
+    priority,
+    enabled: true,
+    direction: "in" as const,
+    action,
+    family: "ipv4" as const,
+    protocol: "tcp" as const,
+    source: "192.0.2.10",
+    destination: "",
+    source_port: "",
+    destination_port: "22",
+    in_interface: "",
+    out_interface: "",
+    comment: "SSH",
+  });
+  const snapshot = () => ({
+    status: "active" as const,
+    observed_at: Math.floor(Date.now() / 1000),
+    fingerprint: "a".repeat(64),
+    ipv6: true,
+    defaults: {
+      in: "deny" as const,
+      out: "allow" as const,
+      route: "deny" as const,
+    },
+    rules: [rule(10)],
+    protection: [{ source: "192.0.2.10", port: 22 }],
+  });
+
+  it("isolates drafts, orders bindings and rules, and tracks per-node results", async () => {
+    const a = await create("UFW A");
+    const b = await create("UFW B");
+    const obs = snapshot();
+    const draftPath = (nodeID: string) => root + "/nodes/" + nodeID;
+    const syncNode = async (n: typeof a, extra: Partial<AgentSync> = {}) => {
+      const response = await request(
+        "/api/agent/v1/sync",
+        "POST",
+        sync(extra),
+        n.token,
+      );
+      expect(response.status).toBe(200);
+      return response.json<ServerSync>();
+    };
+    expect((await request(root + "/groups")).status).toBe(403);
+    expect(
+      (
+        await request(
+          root + "/groups",
+          "POST",
+          { name: "bad", rules: [] },
+          undefined,
+          { ...admin, origin: "https://other.example" },
+        )
+      ).status,
+    ).toBe(403);
+    expect((await syncNode(a)).firewall).toBeUndefined();
+    await syncNode(a, { firewall: obs });
+    await syncNode(b, { firewall: obs });
+    const imported = await request(
+      draftPath(a.node_id) + "/import",
+      "POST",
+      {},
+      undefined,
+      admin,
+    );
+    expect(imported.status).toBe(201);
+    expect(
+      (
+        await request(
+          draftPath(a.node_id) + "/import",
+          "POST",
+          {},
+          undefined,
+          admin,
+        )
+      ).status,
+    ).toBe(409);
+    const group = await (
+      await request(
+        root + "/groups",
+        "POST",
+        {
+          name: "Main",
+          rules: [rule(20, "deny"), rule(10)],
+        },
+        undefined,
+        admin,
+      )
+    ).json<{ id: string; revision: number; rules: unknown[] }>();
+    const earlier = await (
+      await request(
+        root + "/groups",
+        "POST",
+        {
+          name: "Earlier",
+          rules: [{ ...rule(30), comment: "group first" }],
+        },
+        undefined,
+        admin,
+      )
+    ).json<{ id: string }>();
+    const config = {
+      defaults: obs.defaults,
+      protection: obs.protection,
+      bindings: [
+        { group_id: group.id, priority: 20 },
+        { group_id: earlier.id, priority: 10 },
+      ],
+    };
+    expect(
+      (
+        await request(
+          draftPath(a.node_id) + "/draft",
+          "PUT",
+          { ...config, revision: 1 },
+          undefined,
+          admin,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(
+          draftPath(a.node_id) + "/draft",
+          "PUT",
+          { ...config, revision: 1 },
+          undefined,
+          admin,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await request(
+          draftPath(b.node_id) + "/draft",
+          "PUT",
+          { ...config, revision: 0 },
+          undefined,
+          admin,
+        )
+      ).status,
+    ).toBe(200);
+    expect((await syncNode(a)).firewall).toBeUndefined();
+    const getPreview = async () => {
+      const r = await request(
+        draftPath(a.node_id) + "/preview",
+        "POST",
+        {},
+        undefined,
+        admin,
+      );
+      expect(r.status).toBe(200);
+      return r.json<{
+        version: string;
+        after: { rules: { comment: string; action: string }[] };
+        affected: { id: string }[];
+      }>();
+    };
+    const initial = await getPreview();
+    expect(initial.affected.map((n) => n.id)).toEqual([a.node_id, b.node_id]);
+    expect(initial.after.rules.map((r) => [r.comment, r.action])).toEqual([
+      ["group first", "allow"],
+      ["SSH", "allow"],
+      ["SSH", "deny"],
+    ]);
+    const update = await request(
+      root + "/groups/" + group.id,
+      "PUT",
+      { ...group, name: "Updated" },
+      undefined,
+      admin,
+    );
+    expect(update.status).toBe(200);
+    expect(
+      (
+        await request(
+          root + "/publish",
+          "POST",
+          [{ node_id: a.node_id, version: initial.version }],
+          undefined,
+          admin,
+        )
+      ).status,
+    ).toBe(409);
+    const version = (await getPreview()).version;
+    const publish = await request(
+      root + "/publish",
+      "POST",
+      [
+        { node_id: a.node_id, version },
+        { node_id: b.node_id, version: "0".repeat(64) },
+      ],
+      undefined,
+      admin,
+    );
+    expect(publish.status).toBe(200);
+    const queued = await publish.json<{
+      outcomes: { id?: string; error?: string }[];
+    }>();
+    expect(queued.outcomes[0].id).toBeTruthy();
+    expect(queued.outcomes[1].error).toBeTruthy();
+    const job = (await syncNode(a)).firewall!;
+    expect(job.node_id).toBe(a.node_id);
+    expect((await syncNode(b)).firewall).toBeUndefined();
+    const claim = "/api/agent/v1/firewall/claim?id=" + job.id;
+    const confirm = "/api/agent/v1/firewall/confirm?id=" + job.id;
+    expect((await request(claim, "POST", undefined, b.token)).status).toBe(409);
+    expect((await request(confirm, "POST", undefined, a.token)).status).toBe(
+      409,
+    );
+    expect((await request(claim, "POST", undefined, a.token)).status).toBe(204);
+    expect((await request(confirm, "POST", undefined, a.token)).status).toBe(
+      204,
+    );
+    await syncNode(b, { firewall_receipt: { id: job.id, status: "applied" } });
+    expect((await syncNode(a)).firewall?.id).toBe(job.id);
+    expect(
+      (
+        await syncNode(a, {
+          firewall_receipt: { id: job.id, status: "applied" },
+        })
+      ).firewall,
+    ).toBeUndefined();
+    await syncNode(a, { firewall_receipt: { id: job.id, status: "failed" } });
+    const detail = await (
+      await request(draftPath(a.node_id), "GET", undefined, undefined, admin)
+    ).json<{ history: { status: string }[] }>();
+    expect(detail.history[0].status).toBe("applied");
+    const publicBody = await (await request("/api/public/dashboard")).text();
+    expect(publicBody).not.toContain(job.id);
+    expect(publicBody).not.toContain("group first");
   });
 });

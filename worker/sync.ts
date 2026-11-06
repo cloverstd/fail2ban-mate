@@ -1,3 +1,4 @@
+import { firewallFor, firewallSyncStatements } from "./firewall";
 import type {
   AgentSync,
   Policy,
@@ -20,15 +21,13 @@ export async function responseFor(
   )
     .bind(now, node.id, now)
     .run();
-  const [settings, policies, commands] = await Promise.all([
-    env.DB.prepare("SELECT policy_revision FROM settings WHERE id=1").first<{
-      policy_revision: number;
-    }>(),
-    env.DB.prepare(
-      "SELECT id,ip,expires_at FROM whitelist WHERE expires_at IS NULL OR expires_at>? ORDER BY created_at",
-    )
-      .bind(now)
-      .all<Policy>(),
+  const [[settings, policies], commands] = await Promise.all([
+    env.DB.batch<Policy & { policy_revision: number }>([
+      env.DB.prepare("SELECT policy_revision FROM settings WHERE id=1"),
+      env.DB.prepare(
+        "SELECT id,ip,expires_at FROM whitelist_rules WHERE expires_at IS NULL OR expires_at>? ORDER BY created_at",
+      ).bind(now),
+    ]),
     env.DB.prepare(
       "SELECT id,kind,jail,ip,expires_at FROM commands WHERE node_id=? AND status IN ('pending','running') AND expires_at>? ORDER BY created_at,id LIMIT 100",
     )
@@ -50,12 +49,13 @@ export async function responseFor(
       mode: node.mode,
       poll_interval: node.poll_interval,
     },
-    policy_revision: settings!.policy_revision,
+    policy_revision: settings.results[0].policy_revision,
     policies: policies.results,
     commands: commands.results,
     ack_event_ids: ackEvents,
     ack_result_ids: ackResults,
     snapshot_required: node.observed_at === null,
+    ...(await firewallFor(env,node)),
   };
 }
 function upsertBan(env: Env, nodeID: string, b: Ban): D1PreparedStatement {
@@ -73,6 +73,30 @@ function upsertBan(env: Env, nodeID: string, b: Ban): D1PreparedStatement {
     b.observed_at,
   );
 }
+function archiveBan(
+  env: Env,
+  nodeID: string,
+  b: Ban,
+  unbannedAt: number,
+  replaced = false,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO ban_history(id,node_id,jail,ip,country,city,latitude,longitude,observed_at,unbanned_at)
+     SELECT COALESCE((SELECT 'event:'||e.id FROM events e
+       WHERE e.node_id=b.node_id AND e.jail=b.jail AND e.ip=b.ip
+         AND e.kind='ban' AND e.observed_at=b.observed_at ORDER BY e.seq DESC LIMIT 1),?),
+       node_id,jail,ip,country,city,latitude,longitude,observed_at,?
+     FROM bans b WHERE node_id=? AND jail=? AND ip=?${replaced ? " AND observed_at<>?" : ""}
+     ON CONFLICT(id) DO UPDATE SET unbanned_at=excluded.unbanned_at`,
+  ).bind(
+    "snapshot:" + crypto.randomUUID(),
+    unbannedAt,
+    nodeID,
+    b.jail,
+    b.ip,
+    ...(replaced ? [b.observed_at] : []),
+  );
+}
 // All calls for a node are serialized by its Durable Object, including across transports.
 export async function ingest(
   env: Env,
@@ -81,7 +105,8 @@ export async function ingest(
   geo?: Record<string, unknown>,
 ): Promise<ServerSync> {
   const now = Math.floor(Date.now() / 1000);
-  const sql: D1PreparedStatement[] = [];
+  const sql = firewallSyncStatements(env,node,p.firewall,p.firewall_receipt);
+  let lastSeq = node.last_seq;
   for (const e of [...p.events].sort((a, b) => a.seq - b.seq)) {
     sql.push(
       env.DB.prepare(
@@ -101,7 +126,9 @@ export async function ingest(
         e.longitude ?? null,
       ),
     );
-    if (e.seq > node.last_seq)
+    if (e.seq > lastSeq) {
+      lastSeq = e.seq;
+      sql.push(archiveBan(env, node.id, e, e.observed_at, e.kind === "ban"));
       sql.push(
         e.kind === "ban"
           ? upsertBan(env, node.id, e)
@@ -109,10 +136,36 @@ export async function ingest(
               "DELETE FROM bans WHERE node_id=? AND jail=? AND ip=?",
             ).bind(node.id, e.jail, e.ip),
       );
+    }
   }
   if (p.snapshot && p.snapshot.seq >= node.last_seq) {
     // A failed jail read must never erase its last known bans.
     const missing = p.snapshot.unavailable_jails;
+    sql.push(
+      env.DB.prepare(
+        `WITH snapshot_bans AS MATERIALIZED (
+           SELECT json_extract(b.value,'$.jail') jail,json_extract(b.value,'$.ip') ip,
+             json_extract(b.value,'$.observed_at') observed_at
+           FROM json_each(?) j,json_each(j.value,'$.bans') b
+         )
+         INSERT INTO ban_history(id,node_id,jail,ip,country,city,latitude,longitude,observed_at,unbanned_at)
+         SELECT COALESCE((SELECT 'event:'||e.id FROM events e
+             WHERE e.node_id=b.node_id AND e.jail=b.jail AND e.ip=b.ip
+               AND e.kind='ban' AND e.observed_at=b.observed_at ORDER BY e.seq DESC LIMIT 1),
+             'snapshot:'||lower(hex(randomblob(16)))),
+           b.node_id,b.jail,b.ip,b.country,b.city,b.latitude,b.longitude,b.observed_at,?
+         FROM bans b LEFT JOIN snapshot_bans s
+           ON s.jail=b.jail AND s.ip=b.ip AND s.observed_at=b.observed_at
+         WHERE b.node_id=? AND s.ip IS NULL
+           AND b.jail NOT IN (SELECT value FROM json_each(?))
+         ON CONFLICT(id) DO UPDATE SET unbanned_at=excluded.unbanned_at`,
+      ).bind(
+        JSON.stringify(p.snapshot.jails),
+        now,
+        node.id,
+        JSON.stringify(missing),
+      ),
+    );
     sql.push(
       env.DB.prepare(
         `DELETE FROM bans WHERE node_id=?${missing.length ? " AND jail NOT IN (" + missing.map(() => "?").join(",") + ")" : ""}`,
@@ -120,6 +173,32 @@ export async function ingest(
     );
     for (const j of p.snapshot.jails)
       for (const b of j.bans) sql.push(upsertBan(env, node.id, b));
+  }
+  if (p.events.length) {
+    // A full snapshot can overtake the client's event backlog. Recover periods
+    // from late events without letting those events alter the current state.
+    sql.push(
+      env.DB.prepare(
+        `WITH affected AS MATERIALIZED (
+           SELECT DISTINCT json_extract(value,'$.jail') jail,json_extract(value,'$.ip') ip FROM json_each(?)
+         ), periods AS MATERIALIZED (
+           SELECT e.*,(SELECT n.observed_at FROM events n
+             WHERE n.node_id=e.node_id AND n.jail=e.jail AND n.ip=e.ip AND n.seq>e.seq
+             ORDER BY n.seq,n.id LIMIT 1) next_at
+           FROM events e JOIN affected a ON a.jail=e.jail AND a.ip=e.ip
+           WHERE e.node_id=? AND e.kind='ban'
+         )
+         INSERT INTO ban_history(id,node_id,jail,ip,country,city,latitude,longitude,observed_at,unbanned_at)
+         SELECT 'event:'||id,node_id,jail,ip,country,city,latitude,longitude,observed_at,next_at
+         FROM periods WHERE next_at IS NOT NULL
+         ON CONFLICT(id) DO UPDATE SET unbanned_at=excluded.unbanned_at`,
+      ).bind(JSON.stringify(p.events), node.id),
+      env.DB.prepare(
+        `DELETE FROM ban_history AS h WHERE h.node_id=? AND h.id LIKE 'snapshot:%'
+         AND EXISTS (SELECT 1 FROM ban_history e WHERE e.node_id=h.node_id
+           AND e.jail=h.jail AND e.ip=h.ip AND e.observed_at=h.observed_at AND e.id LIKE 'event:%')`,
+      ).bind(node.id),
+    );
   }
   for (const r of p.results)
     sql.push(

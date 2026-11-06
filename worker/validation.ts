@@ -1,3 +1,4 @@
+import { firewallObservation, firewallReceipt } from "./firewall-schema";
 import { z } from "zod";
 import ipaddr from "ipaddr.js";
 export function canonicalIP(value: string): string {
@@ -42,6 +43,8 @@ const ban = z.object({
 });
 export const syncSchema = z
   .object({
+    firewall: firewallObservation.optional(),
+    firewall_receipt: firewallReceipt.optional(),
     protocol: z.literal(1),
     type: z.literal("sync"),
     sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),

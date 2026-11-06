@@ -23,6 +23,11 @@ command -v systemctl >/dev/null 2>&1 || die '需要 systemd'
 [ -d /run/systemd/system ] || die 'systemd 必须正在运行'
 if [ "$ACTION" = uninstall ]; then
   systemctl stop fail2ban-mate.service 2>/dev/null || true
+  if [ -x "$BIN" ] && [ -f "$CONFIG" ] && "$BIN" firewall-capability >/dev/null 2>&1; then
+    "$BIN" firewall-recover --force --config "$CONFIG" || die '无法恢复未确认的防火墙配置，已保留客户端'
+  fi
+  systemctl disable --now fail2ban-mate-firewall.timer fail2ban-mate-firewall-boot.service 2>/dev/null || true
+  rm -f /etc/systemd/system/fail2ban-mate-firewall.timer /etc/systemd/system/fail2ban-mate-firewall.service /etc/systemd/system/fail2ban-mate-firewall-boot.service
   if [ -x "$BIN" ] && [ -f "$CONFIG" ]; then "$BIN" cleanup --config "$CONFIG" || die '无法清理本项目的白名单条目，已保留配置和客户端，请修复 fail2ban 后重试'; fi
   systemctl disable --now fail2ban-mate.service fail2ban-mate-geo.timer 2>/dev/null || true
   rm -f /etc/systemd/system/fail2ban-mate.service /etc/systemd/system/fail2ban-mate-geo.service /etc/systemd/system/fail2ban-mate-geo.timer "$BIN"
@@ -106,7 +111,7 @@ UMask=0077
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/fail2ban-mate /run/fail2ban
+ReadWritePaths=/var/lib/fail2ban-mate /run/fail2ban -/etc/ufw /etc/default
 PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
@@ -136,10 +141,53 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
+FIREWALL=no
+if command -v ufw >/dev/null 2>&1 && "$BIN" firewall-capability >/dev/null 2>&1; then
+  FIREWALL=yes
+  cat > /etc/systemd/system/fail2ban-mate-firewall.service <<'UNIT'
+[Unit]
+Description=Restore an unconfirmed Fail2ban Mate firewall publication
+After=ufw.service
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/bin/fail2ban-mate-client firewall-recover --config /etc/fail2ban-mate/config.json
+TimeoutStartSec=30
+UNIT
+  cat > /etc/systemd/system/fail2ban-mate-firewall.timer <<'UNIT'
+[Unit]
+Description=Check for an expired firewall publication
+[Timer]
+OnBootSec=10
+OnUnitInactiveSec=10
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+UNIT
+  cat > /etc/systemd/system/fail2ban-mate-firewall-boot.service <<'UNIT'
+[Unit]
+Description=Restore pending Fail2ban Mate firewall files before UFW loads
+DefaultDependencies=no
+After=local-fs.target
+Before=ufw.service
+RequiresMountsFor=/var/lib/fail2ban-mate
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/bin/fail2ban-mate-client firewall-recover --boot --config /etc/fail2ban-mate/config.json
+TimeoutStartSec=30
+[Install]
+RequiredBy=ufw.service
+UNIT
+fi
 if [ ! -f /var/lib/fail2ban-mate/city.mmdb ]; then
   "$BIN" geo-update --path /var/lib/fail2ban-mate/city.mmdb || printf '%s\n' '定位库下载失败，客户端仍可工作；稍后执行 systemctl start fail2ban-mate-geo.service 重试。' >&2
 fi
 systemctl daemon-reload
+if [ "$FIREWALL" = yes ]; then
+  systemctl enable fail2ban-mate-firewall-boot.service
+  systemctl enable --now fail2ban-mate-firewall.timer
+fi
 systemctl enable --now fail2ban-mate.service fail2ban-mate-geo.timer
 REPLACED=no
 printf '%s\n' "Fail2ban Mate $VERSION 已安装。查看日志：journalctl -u fail2ban-mate -f"

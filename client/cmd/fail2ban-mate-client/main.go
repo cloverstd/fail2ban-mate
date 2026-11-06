@@ -31,6 +31,9 @@ func run() error {
 	if len(os.Args) < 2 {
 		return fmt.Errorf("usage: fail2ban-mate-client run|enroll|geo-update|version")
 	}
+	if os.Args[1] == "firewall-capability" {
+		return nil
+	}
 	if os.Args[1] == "version" {
 		fmt.Println(version)
 		return nil
@@ -42,10 +45,15 @@ func run() error {
 	server := f.String("server", "", "control server URL")
 	code := f.String("enrollment", "", "one-time enrollment credential")
 	geo := f.String("path", "/var/lib/fail2ban-mate/city.mmdb", "MMDB path")
+	force := f.Bool("force", false, "restore a pending firewall transaction immediately")
+	boot := f.Bool("boot", false, "restore an unfinished firewall transaction before UFW starts")
+	tool := f.String("tool", "", "isolated firewall validation tool")
 	if err := f.Parse(os.Args[2:]); err != nil {
 		return err
 	}
 	switch os.Args[1] {
+	case "firewall-check":
+		return mate.FirewallCheck(ctx, *tool)
 	case "geo-update":
 		return mate.UpdateGeo(ctx, *geo)
 	case "enroll":
@@ -111,7 +119,7 @@ func run() error {
 		}
 		log.Print("enrolled successfully; node token stored in protected config")
 		return nil
-	case "run", "cleanup":
+	case "run", "cleanup", "firewall-recover":
 		b, err := os.ReadFile(*config)
 		if err != nil {
 			return err
@@ -125,6 +133,9 @@ func run() error {
 		}
 		if err = os.MkdirAll(filepath.Dir(c.StatePath), 0700); err != nil {
 			return err
+		}
+		if os.Args[1] == "firewall-recover" {
+			return mate.RecoverFirewall(ctx, c, *boot, *force)
 		}
 		// A single process owns the durable journal. Fail rather than race a second agent.
 		lock, err := os.OpenFile(c.StatePath+".lock", os.O_CREATE|os.O_RDWR, 0600)

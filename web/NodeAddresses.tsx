@@ -16,6 +16,11 @@ export function nodeAddressLabel(node: AddressNode): string {
   return [ipv4, ipv6].filter(Boolean).join(" · ") || "未知 IP";
 }
 
+export function nodeAddressValues(node: AddressNode): string[] {
+  const { ipv4, ipv6 } = addresses(node);
+  return [...new Set([ipv4, ipv6].filter((ip): ip is string => !!ip))];
+}
+
 export function NodeAddresses({ node }: { node?: AddressNode }) {
   const { ipv4, ipv6 } = addresses(node);
   return (

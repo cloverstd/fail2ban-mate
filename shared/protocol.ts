@@ -1,3 +1,9 @@
+import type {
+  FirewallObservation,
+  FirewallReceipt,
+  FirewallTarget,
+} from "./firewall";
+
 export type Mode = "websocket" | "polling";
 export interface Geo {
   country?: string | null;
@@ -38,6 +44,8 @@ export interface Policy {
   expires_at: number | null;
 }
 export interface AgentSync {
+  firewall?: FirewallObservation;
+  firewall_receipt?: FirewallReceipt;
   protocol: 1;
   type: "sync";
   sequence: number;
@@ -52,6 +60,8 @@ export interface AgentSync {
   snapshot?: Snapshot;
 }
 export interface ServerSync {
+  firewall?: FirewallTarget;
+  firewall_refresh?: number;
   protocol: 1;
   type: "sync";
   server_time: number;

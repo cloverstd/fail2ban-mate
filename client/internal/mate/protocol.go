@@ -50,29 +50,33 @@ type RemoteConfig struct {
 	PollInterval int    `json:"poll_interval"`
 }
 type ServerSync struct {
-	Protocol         int          `json:"protocol"`
-	Type             string       `json:"type"`
-	ServerTime       int64        `json:"server_time"`
-	Config           RemoteConfig `json:"config"`
-	PolicyRevision   int64        `json:"policy_revision"`
-	Policies         []Policy     `json:"policies"`
-	Commands         []Command    `json:"commands"`
-	AckEvents        []string     `json:"ack_event_ids"`
-	AckResults       []string     `json:"ack_result_ids"`
-	SnapshotRequired bool         `json:"snapshot_required"`
-	AckSnapshotSeq   int64        `json:"ack_snapshot_seq,omitempty"`
+	Firewall         *FirewallTarget `json:"firewall,omitempty"`
+	FirewallRefresh  int64           `json:"firewall_refresh,omitempty"`
+	Protocol         int             `json:"protocol"`
+	Type             string          `json:"type"`
+	ServerTime       int64           `json:"server_time"`
+	Config           RemoteConfig    `json:"config"`
+	PolicyRevision   int64           `json:"policy_revision"`
+	Policies         []Policy        `json:"policies"`
+	Commands         []Command       `json:"commands"`
+	AckEvents        []string        `json:"ack_event_ids"`
+	AckResults       []string        `json:"ack_result_ids"`
+	SnapshotRequired bool            `json:"snapshot_required"`
+	AckSnapshotSeq   int64           `json:"ack_snapshot_seq,omitempty"`
 }
 type Sync struct {
-	Protocol       int       `json:"protocol"`
-	Type           string    `json:"type"`
-	Sequence       int64     `json:"sequence"`
-	Version        string    `json:"version"`
-	ActualMode     string    `json:"actual_mode"`
-	FallbackReason string    `json:"fallback_reason,omitempty"`
-	ConfigRevision int64     `json:"applied_config_revision"`
-	PolicyRevision int64     `json:"applied_policy_revision"`
-	Error          string    `json:"error,omitempty"`
-	Events         []Event   `json:"events"`
-	Results        []Result  `json:"results"`
-	Snapshot       *Snapshot `json:"snapshot,omitempty"`
+	Firewall        *FirewallObservation `json:"firewall,omitempty"`
+	FirewallReceipt *FirewallReceipt     `json:"firewall_receipt,omitempty"`
+	Protocol        int                  `json:"protocol"`
+	Type            string               `json:"type"`
+	Sequence        int64                `json:"sequence"`
+	Version         string               `json:"version"`
+	ActualMode      string               `json:"actual_mode"`
+	FallbackReason  string               `json:"fallback_reason,omitempty"`
+	ConfigRevision  int64                `json:"applied_config_revision"`
+	PolicyRevision  int64                `json:"applied_policy_revision"`
+	Error           string               `json:"error,omitempty"`
+	Events          []Event              `json:"events"`
+	Results         []Result             `json:"results"`
+	Snapshot        *Snapshot            `json:"snapshot,omitempty"`
 }

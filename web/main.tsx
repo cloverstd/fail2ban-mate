@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -26,8 +26,14 @@ import {
 } from "lucide-react";
 import type { Mode } from "../shared/protocol";
 import type { BanRow, Data, Node, PublicData } from "./types";
+import { Firewall } from "./Firewall";
+import { Integrations } from "./Integrations";
 import { WorldMap } from "./Map";
-import { NodeAddresses, nodeAddressLabel } from "./NodeAddresses";
+import {
+  NodeAddresses,
+  nodeAddressLabel,
+  nodeAddressValues,
+} from "./NodeAddresses";
 import "./style.css";
 
 // Production builds expose only the URLs needed by their audience.
@@ -58,8 +64,16 @@ const actionName: Record<string, string> = {
   "commands.create": "下发命令",
   "whitelist.upsert": "全局加白 / 限时放行",
   "whitelist.delete": "撤销全局加白",
+  "dynamic_whitelist.upsert": "同步动态白名单",
+  "dynamic_whitelist.delete": "删除动态白名单",
+  "integration.create": "创建接入 Token",
+  "integration.rotate": "轮换接入 Token",
+  "integration.revoke": "撤销接入 Token",
+  "firewall.publish": "发布防火墙规则",
+  "firewall.drift": "恢复本机防火墙漂移",
 };
-type Page = "overview" | "nodes" | "bans" | "whitelist" | "logs";
+type Page =
+  "overview" | "nodes" | "bans" | "whitelist" | "integrations" | "firewall" | "logs";
 type Modal =
   | { kind: "node" }
   | { kind: "ban"; node?: string; jail?: string; ip?: string }
@@ -76,6 +90,7 @@ async function api<T = unknown>(
       body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (res.status === 204) return undefined as T;
   const json = (await res.json()) as { error?: string };
   if (!res.ok) throw new Error(json.error || `请求失败 (${res.status})`);
   return json as T;
@@ -153,7 +168,7 @@ function PublicApp() {
       <main className="public-map">
         <WorldMap
           nodes={data.nodes}
-          bans={data.bans}
+          bans={[...data.bans, ...(data.ban_history ?? [])]}
           publicView
           loading={loading}
           error={error}
@@ -166,6 +181,7 @@ function PublicApp() {
 function App() {
   const [data, setData] = useState<Data>(empty),
     [page, setPage] = useState<Page>("overview"),
+    [firewallNode, setFirewallNode] = useState<string>(),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(true),
     [live, setLive] = useState(false),
@@ -174,6 +190,7 @@ function App() {
   const [nodeFilter, setNodeFilter] = useState(""),
     [query, setQuery] = useState(""),
     [service, setService] = useState(""),
+    [banStatus, setBanStatus] = useState(""),
     [since, setSince] = useState(""),
     [selected, setSelected] = useState<Set<string>>(new Set()),
     [listPage, setListPage] = useState(0),
@@ -240,7 +257,7 @@ function App() {
   useEffect(() => {
     setSelected(new Set());
     setListPage(0);
-  }, [nodeFilter, query, service, since, page]);
+  }, [nodeFilter, query, service, since, banStatus, page]);
   useEffect(() => {
     if (toast) {
       const t = setTimeout(() => setToast(""), 5000);
@@ -259,15 +276,27 @@ function App() {
       setBusy(false);
     }
   };
-  const key = (b: BanRow) => `${b.node_id}|${b.jail}|${b.ip}`;
+  const key = (b: BanRow) =>
+    b.id ?? `${b.node_id}|${b.jail}|${b.ip}|${b.observed_at}`;
   const nodeName = (id: string) => {
     const n = data.nodes.find((n) => n.id === id);
     return n?.name || (n ? nodeAddressLabel(n) : "未知节点");
   };
-  const filtered = data.bans.filter(
+  const allBans = useMemo(
+    () =>
+      [...data.bans, ...(data.ban_history ?? [])].sort(
+        (a, b) => b.observed_at - a.observed_at,
+      ),
+    [data.bans, data.ban_history],
+  );
+  const filtered = allBans.filter(
     (b) =>
       (!nodeFilter || b.node_id === nodeFilter) &&
       (!service || b.jail === service) &&
+      (!banStatus ||
+        (banStatus === "banned"
+          ? b.unbanned_at == null
+          : b.unbanned_at != null)) &&
       (!query ||
         `${b.ip} ${place(b)}`.toLowerCase().includes(query.toLowerCase())) &&
       (!since || b.observed_at >= new Date(since).getTime() / 1000),
@@ -275,18 +304,29 @@ function App() {
   const visibleNodes = data.nodes.filter(
     (n) => !nodeFilter || n.id === nodeFilter,
   );
-  const services = [...new Set(data.bans.map((b) => b.jail))].sort();
+  const services = [...new Set(allBans.map((b) => b.jail))].sort();
+  const currentPage = Math.min(
+    listPage,
+    Math.max(0, Math.ceil(filtered.length / 50) - 1),
+  );
+  const pageRows = filtered.slice(currentPage * 50, currentPage * 50 + 50);
+  const selectableRows = pageRows.filter((b) => b.unbanned_at == null);
+  const selectedRows = filtered.filter(
+    (b) => b.unbanned_at == null && selected.has(key(b)),
+  );
   const commands = (rows: BanRow[]) =>
     run(
       () =>
         api(
           "/commands",
-          rows.map((b) => ({
-            node_id: b.node_id,
-            jail: b.jail,
-            ip: b.ip,
-            kind: "unban",
-          })),
+          rows
+            .filter((b) => b.unbanned_at == null)
+            .map((b) => ({
+              node_id: b.node_id,
+              jail: b.jail,
+              ip: b.ip,
+              kind: "unban",
+            })),
         ),
       "解封命令已提交，请查看执行结果",
     );
@@ -307,7 +347,7 @@ function App() {
           <h2>{admin ? "封禁记录" : "当前封禁"}</h2>
           <p>
             {admin
-              ? "按节点与 service 管理已观测到的封禁"
+              ? "包含当前封禁与已解禁历史，按节点与 service 查看"
               : "IP 已脱敏处理，地理位置仅供参考"}
           </p>
         </div>
@@ -347,6 +387,15 @@ function App() {
             <option key={s}>{s}</option>
           ))}
         </select>
+        <select
+          aria-label="筛选封禁状态"
+          value={banStatus}
+          onChange={(e) => setBanStatus(e.target.value)}
+        >
+          <option value="">所有状态（含历史）</option>
+          <option value="banned">封禁中</option>
+          <option value="unbanned">已解禁</option>
+        </select>
         {admin && (
           <input
             type="datetime-local"
@@ -356,16 +405,14 @@ function App() {
           />
         )}
       </div>
-      {admin && selected.size > 0 && (
+      {admin && selectedRows.length > 0 && (
         <div className="selection-bar">
-          已选择 {selected.size} 条{" "}
+          已选择 {selectedRows.length} 条{" "}
           <button
-            disabled={busy || selected.size > 100}
-            onClick={() =>
-              void commands(filtered.filter((b) => selected.has(key(b))))
-            }
+            disabled={busy || selectedRows.length > 100}
+            onClick={() => void commands(selectedRows)}
           >
-            批量解除封禁{selected.size > 100 ? "（最多 100 条）" : ""}
+            批量解除封禁{selectedRows.length > 100 ? "（最多 100 条）" : ""}
           </button>
         </div>
       )}
@@ -378,23 +425,19 @@ function App() {
                   <input
                     aria-label="选择本页封禁"
                     type="checkbox"
+                    disabled={!selectableRows.length}
                     checked={
-                      filtered.slice(listPage * 50, listPage * 50 + 50).length >
-                        0 &&
-                      filtered
-                        .slice(listPage * 50, listPage * 50 + 50)
-                        .every((b) => selected.has(key(b)))
+                      selectableRows.length > 0 &&
+                      selectableRows.every((b) => selected.has(key(b)))
                     }
                     onChange={(e) =>
                       setSelected((s) => {
                         const next = new Set(s);
-                        filtered
-                          .slice(listPage * 50, listPage * 50 + 50)
-                          .forEach((b) =>
-                            e.target.checked
-                              ? next.add(key(b))
-                              : next.delete(key(b)),
-                          );
+                        selectableRows.forEach((b) =>
+                          e.target.checked
+                            ? next.add(key(b))
+                            : next.delete(key(b)),
+                        );
                         return next;
                       })
                     }
@@ -405,19 +448,22 @@ function App() {
               <th>地理位置</th>
               <th>目标节点</th>
               <th>Service</th>
-              <th>观测时间</th>
+              <th>状态</th>
+              <th>封禁观测时间</th>
+              <th>解禁观测时间</th>
               {admin && <th className="right">操作</th>}
             </tr>
           </thead>
           <tbody>
-            {filtered.slice(listPage * 50, listPage * 50 + 50).map((b, i) => (
-              <tr key={key(b) + i}>
+            {pageRows.map((b) => (
+              <tr key={key(b)}>
                 {admin && (
                   <td>
                     <input
                       type="checkbox"
                       aria-label={`选择 ${b.ip}`}
-                      checked={selected.has(key(b))}
+                      disabled={b.unbanned_at != null}
+                      checked={b.unbanned_at == null && selected.has(key(b))}
                       onChange={(e) =>
                         setSelected((s) => {
                           const n = new Set(s);
@@ -450,10 +496,23 @@ function App() {
                 <td>
                   <span className="tag">{b.jail}</span>
                 </td>
+                <td>
+                  <span
+                    className={`badge ${b.unbanned_at == null ? "ban-active" : "ban-released"}`}
+                  >
+                    {b.unbanned_at == null ? "封禁中" : "已解禁"}
+                  </span>
+                </td>
                 <td className="muted nowrap">{time(b.observed_at)}</td>
+                <td className="muted nowrap">
+                  {b.unbanned_at == null ? "—" : time(b.unbanned_at)}
+                </td>
                 {admin && (
                   <td className="row-actions">
-                    <button disabled={busy} onClick={() => void commands([b])}>
+                    <button
+                      disabled={busy || b.unbanned_at != null}
+                      onClick={() => void commands([b])}
+                    >
                       解封
                     </button>
                     <button
@@ -473,7 +532,7 @@ function App() {
           icon={<ShieldCheck />}
           title={loading ? "正在连接防护网络…" : "暂无封禁记录"}
           text={
-            query || nodeFilter || service
+            query || nodeFilter || service || banStatus || since
               ? "尝试调整筛选条件"
               : "节点上报的封禁记录会自动显示在这里"
           }
@@ -482,18 +541,18 @@ function App() {
       {filtered.length > 50 && (
         <div className="pagination">
           <span>
-            第 {listPage + 1} / {Math.ceil(filtered.length / 50)} 页
+            第 {currentPage + 1} / {Math.ceil(filtered.length / 50)} 页
           </span>
           <button
-            disabled={listPage === 0}
-            onClick={() => setListPage((p) => p - 1)}
+            disabled={currentPage === 0}
+            onClick={() => setListPage(currentPage - 1)}
           >
             <ArrowLeft size={14} />
             上一页
           </button>
           <button
-            disabled={(listPage + 1) * 50 >= filtered.length}
-            onClick={() => setListPage((p) => p + 1)}
+            disabled={(currentPage + 1) * 50 >= filtered.length}
+            onClick={() => setListPage(currentPage + 1)}
           >
             下一页
             <ArrowRight size={14} />
@@ -555,11 +614,17 @@ function App() {
                     icon: <LayoutDashboard />,
                   },
                   { id: "nodes", label: "节点管理", icon: <Server /> },
+                  { id: "firewall", label: "防火墙", icon: <ShieldCheck /> },
                   { id: "bans", label: "封禁列表", icon: <Shield /> },
                   {
                     id: "whitelist",
                     label: "全局白名单",
                     icon: <ShieldCheck />,
+                  },
+                  {
+                    id: "integrations",
+                    label: "接口接入",
+                    icon: <LockKeyhole />,
                   },
                   { id: "logs", label: "操作记录", icon: <Terminal /> },
                 ] as const
@@ -568,7 +633,7 @@ function App() {
                   key={item.id}
                   aria-label={item.label}
                   className={page === item.id ? "active" : ""}
-                  onClick={() => setPage(item.id)}
+                  onClick={() => { if (item.id === "firewall") setFirewallNode(undefined); setPage(item.id); }}
                 >
                   {item.icon}
                   <span>{item.label}</span>
@@ -597,8 +662,10 @@ function App() {
                   : {
                       overview: "防护总览",
                       nodes: "节点管理",
+                      firewall: "防火墙",
                       bans: "封禁列表",
                       whitelist: "全局白名单",
+                      integrations: "接口接入",
                       logs: "操作记录",
                     }[page]}
               </h1>
@@ -608,9 +675,11 @@ function App() {
                   : {
                       overview: "你的所有节点，一处掌握。",
                       nodes: "连接 Linux 节点，管理传输与防护状态。",
-                      bans: "查看完整 IP，精确控制每一条封禁。",
+                      bans: "查看当前封禁与历史记录，追踪封禁和解禁时间。",
                       whitelist:
                         "规则同步至全部节点与 service，包括以后新增的节点。",
+                      integrations: "管理用于同步动态白名单的调用凭据。",
+                      firewall: "通过 UFW 规则组管理节点访问。",
                       logs: "追踪远程命令与管理操作。",
                     }[page]}
               </p>
@@ -703,7 +772,7 @@ function App() {
                 />
                 <Stat
                   label="防护服务"
-                  value={services.length}
+                  value={new Set(data.bans.map((b) => b.jail)).size}
                   icon={<Activity size={19} />}
                   note="已观测到封禁的 service"
                   tone="purple"
@@ -889,6 +958,7 @@ function App() {
                     )}
                   </div>
                   <div className="node-card-actions">
+                    <button className="btn small" onClick={() => { setFirewallNode(n.id); setPage("firewall"); }}>查看防火墙</button>
                     <button
                       disabled={busy}
                       onClick={() => {
@@ -973,6 +1043,18 @@ function App() {
               )}
             </div>
           )}
+          {admin && page === "firewall" && (
+            <Firewall nodes={data.nodes} api={api} time={time} initialNode={firewallNode} />
+          )}
+          {admin && page === "integrations" && (
+            <Integrations
+              rows={data.integrations ?? []}
+              busy={busy}
+              api={api}
+              run={run}
+              time={time}
+            />
+          )}
           {admin && page === "whitelist" && (
             <>
               <div className="info-banner">
@@ -980,6 +1062,8 @@ function App() {
                 <span>
                   永久加白和限时放行会解除所有节点上该 IP
                   的当前封禁。到期后恢复正常检测，客户端离线时也会执行到期恢复。
+                  动态规则删除后可能被下次同步重建，持续停用请在接口接入页撤销
+                  Token。
                 </span>
               </div>
               <section className="panel">
@@ -989,7 +1073,8 @@ function App() {
                       <tr>
                         <th>IP 地址</th>
                         <th>有效期</th>
-                        <th>创建者</th>
+                        <th>来源</th>
+                        <th>最近同步</th>
                         <th>同步进度</th>
                         <th className="right">操作</th>
                       </tr>
@@ -1007,7 +1092,12 @@ function App() {
                               <span className="badge success">永久白名单</span>
                             )}
                           </td>
-                          <td>{p.actor}</td>
+                          <td>
+                            {p.source === "integration"
+                              ? `接口 · ${p.actor} / ${p.owner_id}`
+                              : `手动 · ${p.actor}`}
+                          </td>
+                          <td>{p.synced_at ? time(p.synced_at) : "—"}</td>
                           <td>
                             {
                               data.nodes.filter(
@@ -1033,7 +1123,7 @@ function App() {
                               onClick={() =>
                                 void run(() =>
                                   api(
-                                    `/whitelist/${p.id}`,
+                                    `/${p.source === "integration" ? "dynamic-whitelist" : "whitelist"}/${p.id}`,
                                     undefined,
                                     "DELETE",
                                   ),
@@ -1169,6 +1259,7 @@ function App() {
         <Dialog
           modal={modal}
           nodes={data.nodes}
+          visitorIP={data.visitor_ip ?? null}
           busy={busy}
           close={() => setModal(null)}
           submit={async (path, body) => {
@@ -1249,18 +1340,23 @@ function Empty({
 function Dialog({
   modal,
   nodes,
+  visitorIP,
   busy,
   close,
   submit,
 }: {
   modal: Modal;
   nodes: Node[];
+  visitorIP: string | null;
   busy: boolean;
   close: () => void;
   submit: (path: string, body: unknown) => Promise<void>;
 }) {
   const [name, setName] = useState(""),
     [ip, setIP] = useState("ip" in modal ? modal.ip || "" : ""),
+    [ipSource, setIPSource] = useState(
+      modal.kind === "allow" && !modal.ip ? "visitor" : "manual",
+    ),
     [node, setNode] = useState(
       "node" in modal
         ? modal.node ||
@@ -1272,6 +1368,15 @@ function Dialog({
     [duration, setDuration] = useState("3600"),
     [custom, setCustom] = useState("60"),
     [copied, setCopied] = useState(false);
+  const actualIP =
+    modal.kind === "allow" && ipSource === "visitor" ? (visitorIP ?? "") : ip;
+  const nodeIPOptions = nodes.flatMap((node) =>
+    nodeAddressValues(node).map((address) => ({
+      value: `node:${node.id}:${address}`,
+      ip: address,
+      label: `${node.name || "未命名节点"} · ${address}`,
+    })),
+  );
   const n = nodes.find((n) => n.id === node);
   const actualJail = n?.jails?.includes(jail) ? jail : n?.jails?.[0] || "";
   const title = {
@@ -1352,7 +1457,7 @@ function Dialog({
               if (modal.kind === "node") void submit("/nodes", { name });
               if (modal.kind === "allow")
                 void submit("/whitelist", {
-                  ip,
+                  ip: actualIP,
                   duration:
                     duration === "permanent"
                       ? null
@@ -1380,16 +1485,60 @@ function Dialog({
               </label>
             ) : (
               <>
+                {modal.kind === "allow" && (
+                  <label>
+                    IP 来源
+                    <select
+                      aria-label="IP 来源"
+                      value={ipSource}
+                      onChange={(e) => {
+                        const source = e.target.value;
+                        setIP(
+                          source === "visitor"
+                            ? (visitorIP ?? "")
+                            : (nodeIPOptions.find(
+                                (option) => option.value === source,
+                              )?.ip ?? actualIP),
+                        );
+                        setIPSource(source);
+                      }}
+                    >
+                      <option value="visitor" disabled={!visitorIP}>
+                        {visitorIP
+                          ? `当前访问者 · ${visitorIP}`
+                          : "当前访问者（未获取到 IP）"}
+                      </option>
+                      <option value="manual">手动输入</option>
+                      {nodeIPOptions.length > 0 && (
+                        <optgroup label="节点 IP">
+                          {nodeIPOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </select>
+                  </label>
+                )}
                 <label>
                   IP 地址
                   <input
                     autoFocus
                     required
                     placeholder="IPv4 或 IPv6"
-                    value={ip}
-                    onChange={(e) => setIP(e.target.value)}
+                    value={actualIP}
+                    onChange={(e) => {
+                      setIP(e.target.value);
+                      setIPSource("manual");
+                    }}
                   />
                 </label>
+                {modal.kind === "allow" && !visitorIP && (
+                  <p className="modal-note">
+                    未获取到访问者 IP，请选择节点地址或手动输入。
+                  </p>
+                )}
                 {modal.kind === "ban" ? (
                   <>
                     <label>
