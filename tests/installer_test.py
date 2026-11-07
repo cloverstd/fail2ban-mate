@@ -82,6 +82,10 @@ class InstallerTests(unittest.TestCase):
             if action=='upgrade':self.assertEqual(config.read_text(),'{"preserved":true}')
             else:self.assertEqual(config.stat().st_mode&0o777,0o600)
             self.assertIn('systemctl enable --now fail2ban-mate.service fail2ban-mate-geo.timer',calls)
+            service = (root/'etc/systemd/system/fail2ban-mate.service').read_text()
+            write_paths = next(line for line in service.splitlines() if line.startswith('ReadWritePaths=')).split()
+            self.assertIn('ProtectSystem=strict', service)
+            self.assertEqual('/run' in write_paths, ufw)
             if ufw:
                 self.assertIn('systemctl enable --now fail2ban-mate-firewall.timer', calls)
                 self.assertIn('RequiredBy=ufw.service', (root/'etc/systemd/system/fail2ban-mate-firewall-boot.service').read_text())

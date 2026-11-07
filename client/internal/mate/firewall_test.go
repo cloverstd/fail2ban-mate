@@ -65,6 +65,36 @@ func TestFirewallUserFormat(t *testing.T) {
 	}
 }
 
+func TestFirewallImportMissingUnusedIPv6LimitReject(t *testing.T) {
+	defaults := FirewallDefaults{In: "deny", Out: "allow", Route: "deny"}
+	log := `-A ufw6-user-limit -m limit --limit 3/min -j LOG --log-prefix "[UFW LIMIT BLOCK] "`
+	reject := "-A ufw6-user-limit -j REJECT --reject-with icmp6-port-unreachable"
+	hooks := []string{
+		"-P INPUT DROP", "-P OUTPUT ACCEPT", "-P FORWARD DROP",
+		"-A ufw6-before-input -j ufw6-user-input",
+		"-A ufw6-before-output -j ufw6-user-output",
+		"-A ufw6-before-forward -j ufw6-user-forward",
+	}
+	expected := map[string][]string{"ip6tables": {log, reject}}
+	live := map[string][]string{"ip6tables": append(slices.Clone(hooks), log)}
+	if err := verifyFirewall(expected, live, defaults, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFirewall(expected, live, defaults, false); err == nil {
+		t.Fatal("post-reload verification accepted a missing rule")
+	}
+	for _, jump := range []string{"-j", "-g"} {
+		live["ip6tables"] = append(slices.Clone(hooks), log, "-A INPUT "+jump+" ufw6-user-limit")
+		if err := verifyFirewall(expected, live, defaults, true); err == nil {
+			t.Fatal("import accepted a missing rule in a referenced chain")
+		}
+	}
+	live["ip6tables"] = slices.Clone(hooks)
+	if err := verifyFirewall(expected, live, defaults, true); err == nil {
+		t.Fatal("import accepted an unexpected change to the helper chain")
+	}
+}
+
 // Run only in a disposable mount and network namespace. Each fixture root
 // contains etc/ufw, etc/default/ufw and that distribution's usr/share/ufw.
 func TestFirewallFixture(t *testing.T) {
@@ -136,7 +166,7 @@ func TestFirewallFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyFirewall(expected, live, target.Defaults); err != nil {
+	if err := verifyFirewall(expected, live, target.Defaults, false); err != nil {
 		t.Fatal(err)
 	}
 	if firewallFingerprint(external) != firewallFingerprint(oldExternal) {

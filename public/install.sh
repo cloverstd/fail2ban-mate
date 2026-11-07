@@ -96,7 +96,14 @@ REPLACED=yes
 if [ -n "$ENROLLMENT" ]; then "$BIN" enroll --server "$SERVER" --enrollment "$ENROLLMENT" --config "$CONFIG"; fi
 [ -f "$CONFIG" ] || die '客户端配置不存在'
 chmod 0600 "$CONFIG"
-cat > /etc/systemd/system/fail2ban-mate.service <<'UNIT'
+FIREWALL=no
+RUNTIME_WRITES=/run/fail2ban
+if command -v ufw >/dev/null 2>&1 && "$BIN" firewall-capability >/dev/null 2>&1; then
+  FIREWALL=yes
+  # UFW creates and unlinks /run/ufw.lock, so it needs the directory writable.
+  RUNTIME_WRITES=/run
+fi
+cat > /etc/systemd/system/fail2ban-mate.service <<UNIT
 [Unit]
 Description=Fail2ban Mate node client
 Wants=network-online.target
@@ -111,7 +118,7 @@ UMask=0077
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/fail2ban-mate /run/fail2ban -/etc/ufw /etc/default
+ReadWritePaths=/var/lib/fail2ban-mate $RUNTIME_WRITES -/etc/ufw /etc/default
 PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
@@ -141,9 +148,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
-FIREWALL=no
-if command -v ufw >/dev/null 2>&1 && "$BIN" firewall-capability >/dev/null 2>&1; then
-  FIREWALL=yes
+if [ "$FIREWALL" = yes ]; then
   cat > /etc/systemd/system/fail2ban-mate-firewall.service <<'UNIT'
 [Unit]
 Description=Restore an unconfirmed Fail2ban Mate firewall publication

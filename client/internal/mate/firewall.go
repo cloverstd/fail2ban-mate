@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var ufwFiles = []string{"ufw/before.rules", "ufw/before6.rules", "ufw/user.rules", "ufw/user6.rules",
@@ -72,6 +74,7 @@ type firewallPending struct {
 	Backup   map[string]string
 	EventID  string
 	Changed  []string
+	Failure  string `json:",omitempty"`
 }
 
 type firewallManager struct {
@@ -509,7 +512,21 @@ func FirewallCheck(ctx context.Context, tool string) error {
 	return err
 }
 
-func verifyFirewall(expected, live map[string][]string, defaults FirewallDefaults) error {
+const ipv6LimitChain = "ufw6-user-limit"
+
+func referencesIPv6Limit(rules []string) bool {
+	return slices.ContainsFunc(rules, func(line string) bool {
+		fields := strings.Fields(line)
+		for i := 0; i+1 < len(fields); i++ {
+			if (fields[i] == "-j" || fields[i] == "-g") && fields[i+1] == ipv6LimitChain {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func verifyFirewall(expected, live map[string][]string, defaults FirewallDefaults, importing bool) error {
 	for tool, rules := range expected {
 		actual := live[tool]
 		for i, chain := range []string{"INPUT", "OUTPUT", "FORWARD"} {
@@ -549,6 +566,15 @@ func verifyFirewall(expected, live map[string][]string, defaults FirewallDefault
 		}
 		for chain, entries := range expectedChains {
 			if !slices.Equal(entries, actualChains[chain]) {
+				// Some UFW installations lack the default REJECT at the end of this
+				// unused helper. Allow that exact import difference, then verify
+				// the complete chain after UFW reloads.
+				if importing && tool == "ip6tables" && chain == ipv6LimitChain &&
+					len(entries) == 2 && entries[1] == "-A ufw6-user-limit -j REJECT --reject-with icmp6-port-unreachable" &&
+					slices.Equal(entries[:1], actualChains[chain]) &&
+					!referencesIPv6Limit(rules) && !referencesIPv6Limit(actual) {
+					continue
+				}
 				return fmt.Errorf("%s staged rules differ in %s", tool, chain)
 			}
 		}
@@ -611,6 +637,9 @@ func restoreFirewall(ctx context.Context, c Config, j *firewallJournal, boot boo
 	if j.Pending == nil {
 		return nil
 	}
+	if j.Pending.Failure != "" {
+		reason = j.Pending.Failure
+	}
 	err := writeFirewallFiles(j.Pending.Backup)
 	if err == nil && !boot {
 		if setting(j.Pending.Backup["ufw/ufw.conf"], "ENABLED") == "yes" {
@@ -620,7 +649,7 @@ func restoreFirewall(ctx context.Context, c Config, j *firewallJournal, boot boo
 		}
 	}
 	if err != nil {
-		j.Attempt = &FirewallReceipt{ID: j.Pending.ID, Status: "failed", Error: "rollback: " + err.Error(), Event: j.Pending.Event, EventID: j.Pending.EventID, Changed: j.Pending.Changed}
+		j.Attempt = &FirewallReceipt{ID: j.Pending.ID, Status: "failed", Error: reason + "; rollback: " + err.Error(), Event: j.Pending.Event, EventID: j.Pending.EventID, Changed: j.Pending.Changed}
 		_ = WriteJSON(firewallJournalPath(c), j)
 		return err
 	}
@@ -709,7 +738,7 @@ func (m *firewallManager) apply(ctx context.Context, t FirewallTarget, claim fun
 	if j.Confirmed == "" {
 		staged, err := stagedFirewall(ctx, old)
 		if err == nil {
-			err = verifyFirewall(staged, o.Live, o.Defaults)
+			err = verifyFirewall(staged, o.Live, o.Defaults, true)
 		}
 		if err != nil {
 			fail(fmt.Errorf("live UFW rules differ from import: %w", err))
@@ -755,6 +784,10 @@ func (m *firewallManager) install(ctx context.Context, j *firewallJournal, id st
 		fail(fmt.Errorf("firewall rollback timer is inactive"))
 		return
 	}
+	if err := unix.Access("/run", unix.W_OK); err != nil {
+		fail(fmt.Errorf("UFW runtime directory /run is not writable: %w", err))
+		return
+	}
 	expected, err := stagedFirewall(ctx, desired)
 	if err != nil {
 		fail(err)
@@ -777,7 +810,7 @@ func (m *firewallManager) install(ctx context.Context, j *firewallJournal, id st
 		live, _, err = liveFirewall(applyCtx, setting(desired["default/ufw"], "IPV6") == "yes")
 	}
 	if err == nil {
-		err = verifyFirewall(expected, live, defaults)
+		err = verifyFirewall(expected, live, defaults, false)
 	}
 	if err == nil {
 		err = confirm(applyCtx, id, drift)
@@ -791,6 +824,7 @@ func (m *firewallManager) install(ctx context.Context, j *firewallJournal, id st
 		}
 	}
 	if err != nil {
+		j.Pending.Failure = err.Error()
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = restoreFirewall(rollbackCtx, m.Config, j, false, err.Error())
