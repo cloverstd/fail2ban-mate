@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -65,7 +66,7 @@ func TestFirewallUserFormat(t *testing.T) {
 	}
 }
 
-func TestFirewallImportMissingUnusedIPv6LimitReject(t *testing.T) {
+func TestFirewallImportMissingUnusedIPv6LimitVerdicts(t *testing.T) {
 	defaults := FirewallDefaults{In: "deny", Out: "allow", Route: "deny"}
 	log := `-A ufw6-user-limit -m limit --limit 3/min -j LOG --log-prefix "[UFW LIMIT BLOCK] "`
 	reject := "-A ufw6-user-limit -j REJECT --reject-with icmp6-port-unreachable"
@@ -75,7 +76,8 @@ func TestFirewallImportMissingUnusedIPv6LimitReject(t *testing.T) {
 		"-A ufw6-before-output -j ufw6-user-output",
 		"-A ufw6-before-forward -j ufw6-user-forward",
 	}
-	expected := map[string][]string{"ip6tables": {log, reject}}
+	accept := "-A ufw6-user-limit-accept -j ACCEPT"
+	expected := map[string][]string{"ip6tables": {log, reject, accept}}
 	live := map[string][]string{"ip6tables": append(slices.Clone(hooks), log)}
 	if err := verifyFirewall(expected, live, defaults, true); err != nil {
 		t.Fatal(err)
@@ -83,10 +85,12 @@ func TestFirewallImportMissingUnusedIPv6LimitReject(t *testing.T) {
 	if err := verifyFirewall(expected, live, defaults, false); err == nil {
 		t.Fatal("post-reload verification accepted a missing rule")
 	}
-	for _, jump := range []string{"-j", "-g"} {
-		live["ip6tables"] = append(slices.Clone(hooks), log, "-A INPUT "+jump+" ufw6-user-limit")
-		if err := verifyFirewall(expected, live, defaults, true); err == nil {
-			t.Fatal("import accepted a missing rule in a referenced chain")
+	for _, chain := range []string{ipv6LimitChain, ipv6LimitAcceptChain} {
+		for _, jump := range []string{"-j", "-g"} {
+			live["ip6tables"] = append(slices.Clone(hooks), log, "-A INPUT "+jump+" "+chain)
+			if err := verifyFirewall(expected, live, defaults, true); err == nil {
+				t.Fatal("import accepted a missing rule in a referenced chain")
+			}
 		}
 	}
 	live["ip6tables"] = slices.Clone(hooks)
@@ -152,21 +156,30 @@ func TestFirewallFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, err := stagedFirewall(ctx, desired)
-	if err != nil {
+	stateDir := t.TempDir()
+	systemctl := filepath.Join(stateDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\n[ \"$*\" = 'is-active --quiet fail2ban-mate-firewall.timer' ]\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFirewallFiles(desired); err != nil {
-		t.Fatal(err)
+	t.Setenv("PATH", stateDir+":"+os.Getenv("PATH"))
+	config := Config{StatePath: filepath.Join(stateDir, "state.json")}
+	m := firewallManager{Config: config}
+	var j firewallJournal
+	id := UUID()
+	m.install(ctx, &j, id, files, desired, target.Defaults, false, func(context.Context, string, bool) error { return nil })
+	if j.Confirmed != id || j.Pending != nil || j.Attempt.Status != "applied" {
+		t.Fatalf("publication did not commit: %+v", j.Attempt)
 	}
-	if _, err := firewallExec(ctx, "", "ufw", "reload"); err != nil {
-		t.Fatal(err)
+	unexpectedReload := func(context.Context, string, bool) error {
+		t.Fatal("observing the installed rules triggered a drift reload")
+		return nil
+	}
+	m.scan(ctx, unexpectedReload)
+	if m.Receipt == nil || m.Receipt.Status != "applied" || m.Receipt.Event != "" {
+		t.Fatalf("success receipt was lost after the first scan: %+v", m.Receipt)
 	}
 	live, external, err := liveFirewall(ctx, observation.IPv6)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyFirewall(expected, live, target.Defaults, false); err != nil {
 		t.Fatal(err)
 	}
 	if firewallFingerprint(external) != firewallFingerprint(oldExternal) {
@@ -178,9 +191,30 @@ func TestFirewallFixture(t *testing.T) {
 			t.Fatalf("protected SSH source %s missing", p.Source)
 		}
 	}
-	statePath := filepath.Join(t.TempDir(), "state.json")
-	config := Config{StatePath: statePath}
-	j := firewallJournal{Pending: &firewallPending{ID: UUID(), Deadline: 1, Backup: files}}
+	// Reproduce an older release whose verified rules were reserialized
+	// by UFW and whose subsequent rollback reloaded those untagged files.
+	for range 2 {
+		if _, err := firewallExec(ctx, "", "ufw", "reload"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rewritten, err := readFirewallFiles("/")
+	if err != nil || firewallFingerprint(rewritten) == firewallFingerprint(j.Files) {
+		t.Fatal("UFW did not reproduce the on-disk rewrite")
+	}
+	j.DriftPaused = true
+	j.Attempt = &FirewallReceipt{ID: id, Status: "rolled_back", Event: "drift", EventID: UUID()}
+	if err := WriteJSON(firewallJournalPath(config), &j); err != nil {
+		t.Fatal(err)
+	}
+	m.Next = time.Time{}
+	m.scan(ctx, unexpectedReload)
+	repaired, err := readFirewallJournal(config)
+	if err != nil || repaired.DriftPaused || repaired.Confirmed != id ||
+		repaired.Attempt.Status != "applied" || firewallFingerprint(repaired.Files) != firewallFingerprint(rewritten) {
+		t.Fatalf("equivalent UFW rewrite was not recovered: %v %+v", err, repaired.Attempt)
+	}
+	j = firewallJournal{Pending: &firewallPending{ID: UUID(), Deadline: 1, Backup: files}}
 	if err := WriteJSON(firewallJournalPath(config), &j); err != nil {
 		t.Fatal(err)
 	}

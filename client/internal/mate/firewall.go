@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,10 +79,11 @@ type firewallPending struct {
 }
 
 type firewallManager struct {
-	Config      Config
-	Observation *FirewallObservation
-	Receipt     *FirewallReceipt
-	Next        time.Time
+	Config         Config
+	Observation    *FirewallObservation
+	Receipt        *FirewallReceipt
+	Next           time.Time
+	rewriteChecked string
 }
 
 func firewallExec(ctx context.Context, input string, name string, args ...string) (string, error) {
@@ -513,12 +515,14 @@ func FirewallCheck(ctx context.Context, tool string) error {
 }
 
 const ipv6LimitChain = "ufw6-user-limit"
+const ipv6LimitAcceptChain = "ufw6-user-limit-accept"
 
 func referencesIPv6Limit(rules []string) bool {
 	return slices.ContainsFunc(rules, func(line string) bool {
 		fields := strings.Fields(line)
 		for i := 0; i+1 < len(fields); i++ {
-			if (fields[i] == "-j" || fields[i] == "-g") && fields[i+1] == ipv6LimitChain {
+			if (fields[i] == "-j" || fields[i] == "-g") &&
+				(fields[i+1] == ipv6LimitChain || fields[i+1] == ipv6LimitAcceptChain) {
 				return true
 			}
 		}
@@ -566,12 +570,14 @@ func verifyFirewall(expected, live map[string][]string, defaults FirewallDefault
 		}
 		for chain, entries := range expectedChains {
 			if !slices.Equal(entries, actualChains[chain]) {
-				// Some UFW installations lack the default REJECT at the end of this
-				// unused helper. Allow that exact import difference, then verify
-				// the complete chain after UFW reloads.
-				if importing && tool == "ip6tables" && chain == ipv6LimitChain &&
+				// Only the two missing stock verdicts in unreferenced limit
+				// helpers are permitted on import.
+				missingReject := chain == ipv6LimitChain &&
 					len(entries) == 2 && entries[1] == "-A ufw6-user-limit -j REJECT --reject-with icmp6-port-unreachable" &&
-					slices.Equal(entries[:1], actualChains[chain]) &&
+					slices.Equal(entries[:1], actualChains[chain])
+				missingAccept := chain == ipv6LimitAcceptChain && len(actualChains[chain]) == 0 &&
+					slices.Equal(entries, []string{"-A ufw6-user-limit-accept -j ACCEPT"})
+				if importing && tool == "ip6tables" && (missingReject || missingAccept) &&
 					!referencesIPv6Limit(rules) && !referencesIPv6Limit(actual) {
 					continue
 				}
@@ -580,6 +586,52 @@ func verifyFirewall(expected, live map[string][]string, defaults FirewallDefault
 		}
 	}
 	return nil
+}
+
+var mateRuleTag = regexp.MustCompile(`^(-A ufw6?-user-(?:input|output|forward)(?: .+?)?) -m comment --comment (?:"mate:[a-zA-Z0-9_-]{1,64}"|mate:[a-zA-Z0-9_-]{1,64})( -j (?:ACCEPT|DROP|REJECT)(?: --reject-with [a-z0-9-]+)?)$`)
+
+func withoutMateRuleTags(rules []string) []string {
+	normalized := slices.Clone(rules)
+	for i, rule := range normalized {
+		normalized[i] = mateRuleTag.ReplaceAllString(rule, "$1$2")
+	}
+	return normalized
+}
+
+// Recover releases whose on-disk rules were reserialized by UFW before the
+// agent recorded the reload result. Every non-user file and staged rule must
+// match, and restoring only our removed rule tags must recover the live hash.
+func recoverUFWRewrite(ctx context.Context, j firewallJournal, files map[string]string, live map[string][]string) bool {
+	for _, name := range ufwFiles {
+		if name != "ufw/user.rules" && name != "ufw/user6.rules" && files[name] != j.Files[name] {
+			return false
+		}
+	}
+	expected, err := stagedFirewall(ctx, j.Files)
+	if err != nil {
+		return false
+	}
+	disk, err := stagedFirewall(ctx, files)
+	if err != nil || !maps.EqualFunc(expected, disk, func(a, b []string) bool {
+		return slices.Equal(withoutMateRuleTags(a), withoutMateRuleTags(b))
+	}) {
+		return false
+	}
+	tagged := make(map[string][]string, len(live))
+	for tool, actual := range live {
+		byRule := make(map[string][]string)
+		for i, rule := range withoutMateRuleTags(expected[tool]) {
+			byRule[rule] = append(byRule[rule], expected[tool][i])
+		}
+		tagged[tool] = slices.Clone(actual)
+		for i, rule := range withoutMateRuleTags(actual) {
+			if candidates := byRule[rule]; len(candidates) > 0 {
+				tagged[tool][i] = candidates[0]
+				byRule[rule] = candidates[1:]
+			}
+		}
+	}
+	return firewallFingerprint(tagged) == j.LiveHash
 }
 
 func firewallLock(config Config, blocking bool) (*os.File, error) {
@@ -647,6 +699,9 @@ func restoreFirewall(ctx context.Context, c Config, j *firewallJournal, boot boo
 		} else {
 			_, err = firewallExec(ctx, "", "ufw", "--force", "disable")
 		}
+		if err == nil {
+			err = writeFirewallFiles(j.Pending.Backup)
+		}
 	}
 	if err != nil {
 		j.Attempt = &FirewallReceipt{ID: j.Pending.ID, Status: "failed", Error: reason + "; rollback: " + err.Error(), Event: j.Pending.Event, EventID: j.Pending.EventID, Changed: j.Pending.Changed}
@@ -693,6 +748,21 @@ func (m *firewallManager) scan(ctx context.Context, confirm func(context.Context
 		return true
 	}
 	m.Receipt = j.Attempt
+	if j.Pending == nil && j.DriftPaused && j.Confirmed != "" && j.Attempt != nil &&
+		j.Attempt.ID == j.Confirmed && j.Attempt.Event == "drift" && files != nil &&
+		m.rewriteChecked != j.Confirmed {
+		m.rewriteChecked = j.Confirmed
+		if recoverUFWRewrite(ctx, j, files, o.Live) {
+			repaired := j
+			repaired.Files, repaired.LiveHash = files, liveHash
+			repaired.DriftPaused = false
+			repaired.Attempt = &FirewallReceipt{ID: j.Confirmed, Status: "applied", Event: "drift", EventID: j.Attempt.EventID}
+			if WriteJSON(firewallJournalPath(m.Config), &repaired) == nil {
+				j = repaired
+				m.Receipt = j.Attempt
+			}
+		}
+	}
 	if j.Confirmed != "" && firewallFingerprint(files) == firewallFingerprint(j.Files) && liveHash == j.LiveHash {
 		o.Blocked = nil
 	}
@@ -811,6 +881,12 @@ func (m *firewallManager) install(ctx context.Context, j *firewallJournal, id st
 	}
 	if err == nil {
 		err = verifyFirewall(expected, live, defaults, false)
+	}
+	if err == nil {
+		// UFW reload reserializes the user files through its CLI tuples,
+		// dropping Mate rule tags and rules without a CLI tuple. Keep the
+		// verified configuration on disk for the next reload or boot.
+		err = writeFirewallFiles(desired)
 	}
 	if err == nil {
 		err = confirm(applyCtx, id, drift)
